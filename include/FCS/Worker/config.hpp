@@ -1,0 +1,18 @@
+#pragma once
+
+#if !defined(FCS_WORKER_BACKEND_EPOLL)
+#  define FCS_WORKER_BACKEND_EPOLL 0
+#endif
+#if !defined(FCS_WORKER_BACKEND_IOCP)
+#  define FCS_WORKER_BACKEND_IOCP 0
+#endif
+#if !defined(FCS_WORKER_BACKEND_KQUEUE)
+#  define FCS_WORKER_BACKEND_KQUEUE 0
+#endif
+#if !defined(FCS_WORKER_BACKEND_IO_URING)
+#  define FCS_WORKER_BACKEND_IO_URING 0
+#endif
+
+#if (FCS_WORKER_BACKEND_EPOLL + FCS_WORKER_BACKEND_IOCP + FCS_WORKER_BACKEND_KQUEUE + FCS_WORKER_BACKEND_IO_URING) != 1
+#  error "Define exactly one FCS_WORKER_BACKEND_* backend."
+#endif
