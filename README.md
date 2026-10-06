@@ -71,7 +71,7 @@ int main() {
     service.post<event_tag>(1);
 
     // Future
-    auto fut = pool->enqueue_and_poll(FCS::Worker::workload::Fast, [iterations]() -> FCS::async_result<std::uint64_t> {
+    auto fut = service.enqueue_and_poll(FCS::Worker::workload::Fast, [iterations]() -> FCS::async_result<std::uint64_t> {
         // For checkpoint:
         // co_await worker::yield_point();
         // Non-coroutine:
@@ -93,11 +93,11 @@ int main() {
     }
     std::cout << *my_data << " Worker ID: " << fut.worker_id() << " In Sequence: " << fut.sequence() << '\n';
     // Timers
-    auto timer_accepted = worker::enqueue_until(worker::timeout_mode::timer, 50ms, []() { std::cout << "Matured! For precision: it's nanoseconds by default.\n"; });
+    auto timer_accepted = service.enqueue_until(worker::timeout_mode::timer, 50ms, []() { std::cout << "Matured! For precision: it's nanoseconds by default.\n"; });
     // WARNING: timeout_mode::timer MODE IS INSTRUSIVE. IT CAN SWAP PLACES WITH YOUR OTHER TASKS ON THE WORKER'S LOCAL QUEUE. For non-critical timeout: prefer lane-based firing mode instead. (worker::timeout_mode::fast_lane, worker::timeout_mode::slow_lane)
 
     // Or bound the timer to existing event:
-    timer_accepted = worker::enqueue_until<event_tag>(worker::timeout_mode::fast_lane, 50ms, /*callback unused*/ []{}, std::uint64_t{1}, /* Args here */);
+    timer_accepted = service.enqueue_until<event_tag>(worker::timeout_mode::fast_lane, 50ms, /*callback unused*/ []{}, std::uint64_t{1}, /* Args here */);
     // subscription_handle.cancel();
 
 
@@ -105,7 +105,7 @@ int main() {
     // service.scheduler_metadata();
     // service.worker_profile(worker id)
     // service.debug_dump(); // by default: stderr
-    service.stop(); // Stop just kills the runtime, you can restart it anytime. Some configs can be made on the fly (hot-swappable).
+    service.stop(); // Stop just kills the runtime, you can restart it. Some configs can be made on the fly (hot-swappable).
     return 0;
 }
 ```
@@ -118,4 +118,4 @@ There are tuning mechanism available for you to configure, see `include/FCS/Work
 - Linux
 
 # License
-The project is using a permissive BSD 3-Clause license, free of charge. I am not responsible for derivatives (attribution).
+The project is using a permissive BSD 3-Clause license, free of charge. Do not attribute me for derivates (attribution). See `LICENSE.`
