@@ -11,8 +11,11 @@ namespace FCS::Worker::detail {
 
     // Defaults only. The real capacities are template parameters: a pool's task size is
     // pool_traits::task_bytes, its callback size pool_traits::callback_bytes.
-    //  task: must hold a posted completion<Size> (about Size + 96 bytes), so 384 fits reads of up to ~256 bytes.
-    inline constexpr std::size_t default_task_bytes = 384;
+    //  task: 128 holds a dozen captured pointers/references and keeps a queue slot to ~3 cache lines.
+    //        It is deliberately NOT sized for I/O completions: those carry their read buffer by value (see
+    //        channel post: a payload that does not fit is boxed -- one allocation -- unless the pool is
+    //        given a larger task_bytes).
+    inline constexpr std::size_t default_task_bytes = 128;
     inline constexpr std::size_t default_callback_bytes = 192;
 
     // A move-only, type-erased callable stored *inline*: Bytes of aligned storage inside the
@@ -106,9 +109,22 @@ namespace FCS::Worker::detail {
             }
         }
 
-        alignas(Align) unsigned char storage_[Bytes];
+        // ops_ comes BEFORE the storage on purpose: a typical task is a few captures, and with the
+        // pointer in front, the captures and the dispatch pointer land in the same cache line. Put
+        // after a 384-byte buffer it was always a second line -- every push and every pop touched
+        // two lines per task instead of one, which is exactly the kind of cost that only shows up
+        // on a loaded multi-core machine.
         const vtable* ops_{nullptr};
+        alignas(Align) unsigned char storage_[Bytes];
     };
+
+
+    // Stores `f` inline if it fits in `Bytes`, otherwise boxes it (one allocation). Used ONLY where
+    // the library builds a task out of data it did not choose the size of -- today, delivering an
+    // I/O completion whose read buffer is part of the payload. A user's own enqueue() never boxes
+    // silently: it either fits or fails to compile.
+    template<std::size_t Bytes, typename F>
+    [[nodiscard]] auto fit_or_box(F&& f);
 
 }
 
@@ -123,6 +139,16 @@ namespace FCS::Worker {
         return [owned = std::make_unique<D>(std::forward<F>(f))](auto&&... args) mutable -> decltype(auto) {
             return std::invoke(*owned, std::forward<decltype(args)>(args)...);
         };
+    }
+
+}
+
+namespace FCS::Worker::detail {
+
+    template<std::size_t Bytes, typename F>
+    [[nodiscard]] auto fit_or_box(F&& f) {
+        if constexpr (sizeof(std::decay_t<F>) <= Bytes) return std::decay_t<F>(std::forward<F>(f));
+        else return ::FCS::Worker::boxed(std::forward<F>(f));
     }
 
 }

@@ -53,9 +53,10 @@ namespace FCS::Worker::backend::epoll {
     // reclaim() frees. Assigning over a std::function the poller was still
     // executing (previously: register_sink() reassigning on_writable) was a
     // reproducible heap-use-after-free.
-    class backend final : public generic_eventlooper<backend, int> {
+    template<typename Pool = pool_service<>>
+    class backend final : public generic_eventlooper<backend<Pool>, int, Pool> {
     public:
-        explicit backend(pool_service<>& service);
+        explicit backend(Pool& service);
         ~backend();
 
         void start_backend();
@@ -151,7 +152,8 @@ namespace FCS::Worker::backend::epoll {
         std::atomic_bool scan_needed_{false};
     };
 
-    using eventlooper = backend;
+    using eventlooper = backend<pool_service<>>;
+    template<typename Pool> using basic_eventlooper = backend<Pool>;
 
 }
 

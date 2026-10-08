@@ -25,7 +25,7 @@ target_include_directories(FCS-Workers INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/inc
 target_link_libraries(FCS-Workers INTERFACE Threads::Threads)
 
 if(WIN32)
-    target_compile_definitions(FCS-Workers INTERFACE FCS_WORKER_BACKEND_IOCP=1)
+    target_compile_definitions(FCS-Workers INTERFACE FCS_WORKER_BACKEND_IOCP=1 NOMINMAX)
     target_link_libraries(FCS-Workers INTERFACE ws2_32)
 else()
     option(FCS_USE_IO_URING "Whether to prefer io_uring instead of epoll" OFF)
@@ -35,7 +35,7 @@ else()
         include(cmake/ProbeIoUring.cmake)
         fcs_probe_io_uring(_fcs_io_uring_ok)
         if(NOT _fcs_io_uring_ok)
-            message(WARNING "FCS_USE_IO_URING=ON but the io_uring probe failed here; falling back to the epoll backend "
+            message(WARNING "FCS_USE_IO_URNIG=ON but the io_uring probe failed here; falling back to the epoll backend "
                             "(pass -DFCS_IO_URING_PROBE=OFF to force io_uring anyway)")
             set(_fcs_use_io_uring OFF)
         endif()
@@ -67,7 +67,7 @@ endif()
 add_executable(fcs_workers_example examples/example.cpp)
 target_link_libraries(fcs_workers_example PRIVATE FCS-Workers)
 
-add_executable(fcs_workers_stressor benchmarks/pool_stressor.cpp)
+add_executable(fcs_workers_stressor stressors/pool_stressor.cpp)
 target_link_libraries(fcs_workers_stressor PRIVATE FCS-Workers)
 if(WIN32)
     target_link_libraries(fcs_workers_stressor PRIVATE winmm) # timeBeginPeriod
@@ -88,6 +88,10 @@ target_link_libraries(fcs_workers_coop_yield_test PRIVATE FCS-Workers)
 # Pool traits: custom semaphore type, unbounded admission gate, timer capacity, and their concepts.
 add_executable(fcs_workers_pool_traits_test tests/pool_traits_test.cpp)
 target_link_libraries(fcs_workers_pool_traits_test PRIVATE FCS-Workers)
+
+# Interruptible mutex (sync/interruptible_mutex.hpp): exclusion survives interrupt(), guards really hold the lock.
+add_executable(fcs_workers_interruptible_mutex_test tests/interruptible_mutex_test.cpp)
+target_link_libraries(fcs_workers_interruptible_mutex_test PRIVATE FCS-Workers)
 
 # Bounded O(log N) timer min-heap (replaced an unbounded mutex-guarded one).
 add_executable(fcs_workers_timer_heap_test tests/timer_heap_test.cpp)
@@ -111,20 +115,20 @@ target_link_libraries(fcs_workers_backend_contract PRIVATE FCS-Workers)
 
 # Raw Winsock/IOCP ceiling (no pool) -- Windows only; see the file header.
 if(WIN32)
-    add_executable(fcs_workers_iocp_ceiling benchmarks/iocp_ceiling.cpp)
+    add_executable(fcs_workers_iocp_ceiling stressors/iocp_ceiling.cpp)
     target_link_libraries(fcs_workers_iocp_ceiling PRIVATE ws2_32 mswsock)
 endif()
 
 # Wakeup latency / submit throughput benchmark (A/B across library versions).
-add_executable(fcs_workers_wake_bench benchmarks/wake_bench.cpp)
+add_executable(fcs_workers_wake_bench stressors/wake_stress_ceiling.cpp)
 target_link_libraries(fcs_workers_wake_bench PRIVATE FCS-Workers)
 
 # steal() work-redistribution benchmark (idle-estimate cache A/B via the ttl argument).
-add_executable(fcs_workers_steal_bench benchmarks/steal_bench.cpp)
+add_executable(fcs_workers_steal_bench stressors/steal_ceiling.cpp)
 target_link_libraries(fcs_workers_steal_bench PRIVATE FCS-Workers)
 
 # Backend A/B drain benchmark (TCP loopback on every OS). Build the same source against each backend.
-add_executable(fcs_workers_backend_bench benchmarks/backend_bench.cpp)
+add_executable(fcs_workers_backend_bench stressors/backend_stress.cpp)
 target_link_libraries(fcs_workers_backend_bench PRIVATE FCS-Workers)
 
 # Regression test for epoll registration/handler lifetime under concurrent dispatch.

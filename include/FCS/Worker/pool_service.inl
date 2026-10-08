@@ -193,7 +193,12 @@ namespace FCS::Worker {
         requires (std::copy_constructible<std::decay_t<Args>> && ...)
     std::size_t pool_service<QueueCapacity, Traits>::post_from(source_kind source, Args&&... args) {
         using channel_t = detail::static_channel<Tag, Traits::callback_bytes, std::decay_t<Args>...>;
-        auto enqueue_work = [this, source](task_type&& work) { return submit({workload::Fast, source, std::move(work)}); };
+        // The dispatch task carries the posted payload by value (for an I/O completion that includes its
+        // whole read buffer), so it is the one place the library -- not the caller -- decides its size:
+        // inline when it fits this pool's task_bytes, boxed (one allocation) when it does not.
+        auto enqueue_work = [this, source](auto&& work) {
+            return submit(queued_task_type{workload::Fast, source, task_type{detail::fit_or_box<Traits::task_bytes>(std::move(work))}});
+        };
         return channel<Tag, channel_t>().post(enqueue_work, args...);
     }
 

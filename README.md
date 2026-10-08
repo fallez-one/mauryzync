@@ -31,9 +31,12 @@ see `src/example.cpp`. For full API (including configurations), consult `include
 
 ## Overview
 ```cpp
-#include <FCS/Workers/workers.hpp>
+#include <FCS/Worker/workers.hpp>
+#include <FCS/Worker/sync/interruptible_mutex.hpp>
+#include <FCS/Worker/sync/ordered_mutex.hpp>
 #include <iostream>
 namespace worker = FCS::Worker;
+namespace sync = FCS::synchronization;
 
 struct event_tag{};
 
@@ -106,6 +109,34 @@ int main() {
     // service.worker_profile(worker id)
     // service.debug_dump(); // by default: stderr
     service.stop(); // Stop just kills the runtime, you can restart it. Some configs can be made on the fly (hot-swappable).
+
+    // I also provide an interruptible mutex if you prefer:
+    {
+        // Variant one: unfair, barging is allowed
+        sync::interruptible_mutex mtx;
+        mtx.lock(); // this is irrecoverable deadlock. Standard mutex guarantee.
+        mtx.unlock();
+        if(mtx.lock_interruptible()) {
+            // acquired, do something...
+            mtx.unlock();
+        }
+        // STL std::lock_guard works
+        {
+            std::lock_guard<sync::interruptible_mutex> guard {mtx};
+            // do something
+        }
+        // Or the interruptible
+        {
+            sync::interruptible_mutex_guard guard{ mtx };
+            mtx.rollback(); // interrupt all
+            // Throwing variant: sync::interruptible_mutex_guard_throwable
+        }
+    }
+    {
+        // Or, if you want fairness:
+        sync::small_ordered_mutex mtx; // Alias for sync::ordered_mutex<std::uint8_t>
+        // The same thing, really you would expect from mutex.
+    }
     return 0;
 }
 ```

@@ -10,22 +10,26 @@ namespace FCS::Worker::backend::io_uring {
 
     // ---------------------------------------------------------------- lifecycle
 
-    inline backend::backend(pool_service<>& service) : generic_eventlooper<backend, int>(service) {
+    template<typename Pool>
+    inline backend<Pool>::backend(Pool& service) : generic_eventlooper<backend<Pool>, int, Pool>(service) {
         wakeup_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     }
 
-    inline backend::~backend() {
+    template<typename Pool>
+    inline backend<Pool>::~backend() {
         stop_backend();
         discard_unarmed();
         if (wakeup_fd_ >= 0) ::close(wakeup_fd_);
     }
 
-    inline void backend::start_backend() {
-        generic_eventlooper<backend, int>::start_backend();
+
+    template<typename Pool>
+    inline void backend<Pool>::start_backend() {
+        generic_eventlooper<backend<Pool>, int, Pool>::start_backend();
         bool expected = false;
         if (!polling_.compare_exchange_strong(expected, true)) return;
 
-        const bool dedicated = service().execution_policy() == execution::policy::dedicated_poller;
+        const bool dedicated = this->service().execution_policy() == execution::policy::dedicated_poller;
         // Created here rather than in the constructor because the ring's
         // shape depends on the execution policy, which isn't final until now.
         // A fresh ring on every start also means a restarted dedicated poller
@@ -47,11 +51,13 @@ namespace FCS::Worker::backend::io_uring {
             // execution::shared_worker -- no dedicated OS thread, and no
             // eventfd poll either (nothing blocks that a wake would need to
             // interrupt); ordinary pool workers drive the ring via poll_once().
-            poll_hook_ = service().register_poll_hook(this, &backend::poll_once);
+            poll_hook_ = this->service().register_poll_hook(this, &backend::poll_once);
         }
     }
 
-    inline void backend::stop_backend() noexcept {
+
+    template<typename Pool>
+    inline void backend<Pool>::stop_backend() noexcept {
         const bool was_polling = polling_.exchange(false);
         if (poller_.joinable()) {
             // Joined even if polling_ was already cleared by a failed
@@ -62,16 +68,18 @@ namespace FCS::Worker::backend::io_uring {
             // Waits out any poll_once() already in flight on another worker
             // before returning -- see poll_registry::unregister(). From here
             // this thread is the only driver, so it may run the shutdown itself.
-            service().unregister_poll_hook(poll_hook_);
+            this->service().unregister_poll_hook(poll_hook_);
             shutdown_ring();
         }
-        generic_eventlooper<backend, int>::stop_backend();
+        generic_eventlooper<backend<Pool>, int, Pool>::stop_backend();
     }
 
     // ----------------------------------------------------------- any-thread API
 
+
+    template<typename Pool>
     template<typename Tag, std::size_t Size, common::recv_option Options, typename Reader, typename Source, typename Callback>
-    subscription backend::register_source(Source&& source, Reader&& reader, Callback&& callback) {
+    subscription backend<Pool>::register_source(Source&& source, Reader&& reader, Callback&& callback) {
         static_assert(reader_callable<Size, std::remove_cvref_t<Reader>, common::completed_source>,
                       "Reader must be callable with a detail::completed_source& and return read_result<Size>");
 
@@ -90,7 +98,7 @@ namespace FCS::Worker::backend::io_uring {
         registration_ptr->buffer_size = Size;
         registration_ptr->buffer = std::make_unique<std::byte[]>(Size);
         if (kind == source_kind::datagram) prepare_datagram_control(*registration_ptr);
-        registration_ptr->channel_subscription = service().template subscribe<Tag>(std::forward<Callback>(callback));
+        registration_ptr->channel_subscription = this->service().template subscribe<Tag>(std::forward<Callback>(callback));
         registration_ptr->on_event = [this, reader_fn = std::forward<Reader>(reader)](registration& reg, std::int32_t res) mutable -> action {
             completion<Size> c{};
             c.user_data = reg.h.index;
@@ -118,7 +126,7 @@ namespace FCS::Worker::backend::io_uring {
                 c.raw_status = res;
             }
             c.completed_at = std::chrono::steady_clock::now();
-            (void)service().template post<Tag>(c);
+            (void)this->service().template post<Tag>(c);
             return next;
         };
 
@@ -132,8 +140,10 @@ namespace FCS::Worker::backend::io_uring {
         return subscription{this, &backend::cancel_slot, table::pack(handle)};
     }
 
+
+    template<typename Pool>
     template<typename Tag, std::size_t Size, typename Writer, typename Sink, typename Callback>
-    subscription backend::register_sink(Sink&& sink, Writer&& writer, Callback&& callback) {
+    subscription backend<Pool>::register_sink(Sink&& sink, Writer&& writer, Callback&& callback) {
         static_assert(writer_callable<std::remove_cvref_t<Writer>, common::readiness_sink>,
                       "Writer must be callable with a detail::readiness_sink& and return a byte count");
 
@@ -148,7 +158,7 @@ namespace FCS::Worker::backend::io_uring {
         registration_ptr->fd = fd;
         registration_ptr->kind = kind;
         registration_ptr->dir = direction::write;
-        registration_ptr->channel_subscription = service().template subscribe<Tag>(std::forward<Callback>(callback));
+        registration_ptr->channel_subscription = this->service().template subscribe<Tag>(std::forward<Callback>(callback));
         registration_ptr->on_event = [this, writer_fn = std::forward<Writer>(writer)](registration& reg, std::int32_t res) mutable -> action {
             completion<Size> c{};
             c.user_data = reg.h.index;
@@ -162,7 +172,7 @@ namespace FCS::Worker::backend::io_uring {
                 c.status = completion_status::error;
                 c.raw_status = res;
                 c.error = common::from_native_error(static_cast<int>(-res));
-                (void)service().template post<Tag>(c);
+                (void)this->service().template post<Tag>(c);
                 return action::retire;
             }
 
@@ -189,7 +199,7 @@ namespace FCS::Worker::backend::io_uring {
                 c.status = completion_status::ok;
                 c.raw_status = static_cast<std::int64_t>(written);
             }
-            (void)service().template post<Tag>(c);
+            (void)this->service().template post<Tag>(c);
             return next;
         };
 
@@ -207,7 +217,8 @@ namespace FCS::Worker::backend::io_uring {
     // registration's RECVMSG needs -- one iovec pointing at the registration's
     // own `buffer`, so payload bytes land exactly where a plain READ would
     // have put them.
-    inline void backend::prepare_datagram_control(registration& registration_ref) {
+    template<typename Pool>
+    inline void backend<Pool>::prepare_datagram_control(registration& registration_ref) {
         registration_ref.peer_addr = std::make_unique<sockaddr_storage>();
         registration_ref.iov = std::make_unique<struct iovec>();
         registration_ref.msg = std::make_unique<struct msghdr>();
@@ -223,7 +234,8 @@ namespace FCS::Worker::backend::io_uring {
     // Hands a fully-initialized registration to the driver. Only the two
     // stores below are visible to other threads; everything else about the
     // registration was written before the release store.
-    inline bool backend::publish(registration* registration_ptr) noexcept {
+    template<typename Pool>
+    inline bool backend<Pool>::publish(registration* registration_ptr) noexcept {
         auto* cmd = new (std::nothrow) command{};
         if (!cmd) return false;
         cmd->what = command::kind::arm;
@@ -234,7 +246,9 @@ namespace FCS::Worker::backend::io_uring {
         return true;
     }
 
-    inline void backend::post_command(command::kind what, table::handle h) noexcept {
+
+    template<typename Pool>
+    inline void backend<Pool>::post_command(command::kind what, table::handle h) noexcept {
         auto* cmd = new (std::nothrow) command{};
         if (!cmd) {
             // Out of memory: the slot is already marked cancelled; make the
@@ -251,7 +265,8 @@ namespace FCS::Worker::backend::io_uring {
     // Never dereferences the registration: it may already have been freed by
     // the driver. All it does is the lock-free slot-state transition; the
     // driver does the rest when it sees the command.
-    inline bool backend::cancel_slot(void* owner, std::size_t packed) noexcept {
+    template<typename Pool>
+    inline bool backend<Pool>::cancel_slot(void* owner, std::size_t packed) noexcept {
         auto* self = static_cast<backend*>(owner);
         const auto h = table::unpack(packed);
         if (!self->slots_state_.request_cancel(h)) return false;
@@ -259,7 +274,9 @@ namespace FCS::Worker::backend::io_uring {
         return true;
     }
 
-    inline void backend::wake() noexcept {
+
+    template<typename Pool>
+    inline void backend<Pool>::wake() noexcept {
         if (wakeup_fd_ >= 0) { std::uint64_t one{1}; (void)!::write(wakeup_fd_, &one, sizeof(one)); }
     }
 
@@ -267,13 +284,16 @@ namespace FCS::Worker::backend::io_uring {
     // run_loop(): either we see that the poller is about to block (and wake
     // it), or the poller sees our command before it blocks. In shared_worker
     // mode nothing ever sleeps, so this costs one relaxed-ish load.
-    inline void backend::wake_if_sleeping() noexcept {
+    template<typename Pool>
+    inline void backend<Pool>::wake_if_sleeping() noexcept {
         if (sleeping_.load(std::memory_order_seq_cst)) wake();
     }
 
     // ------------------------------------------------------------- driver side
 
-    inline io_uring_sqe* backend::acquire_sqe() noexcept {
+
+    template<typename Pool>
+    inline io_uring_sqe* backend<Pool>::acquire_sqe() noexcept {
         for (int attempt = 0; attempt < 4; ++attempt) {
             if (auto* sqe = ring_.get_sqe()) return sqe;
             (void)ring_.submit_and_wait(0); // SQ full: hand what's queued to the kernel and try again
@@ -281,7 +301,9 @@ namespace FCS::Worker::backend::io_uring {
         return nullptr;
     }
 
-    inline bool backend::queue_operation(registration& registration_ref) noexcept {
+
+    template<typename Pool>
+    inline bool backend<Pool>::queue_operation(registration& registration_ref) noexcept {
         auto* sqe = acquire_sqe();
         if (!sqe) return false;
         registration_ref.submitted_at = std::chrono::steady_clock::now();
@@ -309,7 +331,9 @@ namespace FCS::Worker::backend::io_uring {
         return true;
     }
 
-    inline void backend::queue_cancel_of(std::uint64_t target) noexcept {
+
+    template<typename Pool>
+    inline void backend<Pool>::queue_cancel_of(std::uint64_t target) noexcept {
         auto* sqe = acquire_sqe();
         if (!sqe) return;
         detail::prep_cancel(sqe, target, ack_user_data);
@@ -318,7 +342,9 @@ namespace FCS::Worker::backend::io_uring {
         (void)ring_.submit_and_wait(0);
     }
 
-    inline void backend::arm_wakeup() noexcept {
+
+    template<typename Pool>
+    inline void backend<Pool>::arm_wakeup() noexcept {
         if (wake_armed_ || wakeup_fd_ < 0) return;
         if (auto* sqe = acquire_sqe()) {
             detail::prep_poll_add(sqe, wakeup_fd_, static_cast<short>(POLLIN), wake_user_data);
@@ -330,7 +356,8 @@ namespace FCS::Worker::backend::io_uring {
     // Frees a registration. Callers guarantee no SQE for it is outstanding --
     // that guarantee is what makes it safe to release the buffer the kernel
     // was writing into, and to let the slot be claimed again.
-    inline void backend::finish(registration* registration_ptr, bool deliver_pending) noexcept {
+    template<typename Pool>
+    inline void backend<Pool>::finish(registration* registration_ptr, bool deliver_pending) noexcept {
         // A registration that ended on its own (EOF/error) has just post()ed its
         // terminal completion; retire() -- not the destructor's cancel() -- so
         // that completion, still queued in the pool, isn't dropped with it.
@@ -342,7 +369,9 @@ namespace FCS::Worker::backend::io_uring {
         slots_state_.release(h.index);
     }
 
-    inline bool backend::service_commands() noexcept {
+
+    template<typename Pool>
+    inline bool backend<Pool>::service_commands() noexcept {
         if (sweep_needed_.exchange(false, std::memory_order_acq_rel)) sweep_cancelled();
 
         bool any = false;
@@ -375,7 +404,8 @@ namespace FCS::Worker::backend::io_uring {
     }
 
     // Fallback for a cancel command that couldn't be allocated.
-    inline void backend::sweep_cancelled() noexcept {
+    template<typename Pool>
+    inline void backend<Pool>::sweep_cancelled() noexcept {
         for (auto& slot : slots_) {
             auto* registration_ptr = slot.load(std::memory_order_acquire);
             if (!registration_ptr || slots_state_.live(registration_ptr->h)) continue;
@@ -388,11 +418,15 @@ namespace FCS::Worker::backend::io_uring {
         }
     }
 
-    inline unsigned backend::reap(unsigned max) {
+
+    template<typename Pool>
+    inline unsigned backend<Pool>::reap(unsigned max) {
         return ring_.drain(max, [this](std::uint64_t user_data, std::int32_t res) { handle_cqe(user_data, res); });
     }
 
-    inline void backend::handle_cqe(std::uint64_t user_data, std::int32_t res) {
+
+    template<typename Pool>
+    inline void backend<Pool>::handle_cqe(std::uint64_t user_data, std::int32_t res) {
         if (inflight_ != 0) --inflight_; // every SQE yields exactly one CQE
         if (user_data == wake_user_data) { wake_armed_ = false; woke_ = true; return; }
         if (user_data == ack_user_data) return; // just an ack, not a real completion
@@ -419,7 +453,9 @@ namespace FCS::Worker::backend::io_uring {
         finish(registration_ptr, /*deliver_pending=*/next == action::retire);
     }
 
-    inline void backend::run_loop() {
+
+    template<typename Pool>
+    inline void backend<Pool>::run_loop() {
         if (const int rc = ring_.enable(); rc < 0) {
             // Couldn't become the ring's submitter: nothing can ever run.
             setup_error_.store(-rc, std::memory_order_relaxed);
@@ -465,7 +501,8 @@ namespace FCS::Worker::backend::io_uring {
     // pool worker's own loop. poll_registry guarantees at most one thread is
     // inside this per backend at a time, which is exactly the single-driver
     // contract the ring needs. Makes no syscall when there is nothing to do.
-    inline bool backend::poll_once(void* owner) noexcept {
+    template<typename Pool>
+    inline bool backend<Pool>::poll_once(void* owner) noexcept {
         auto* self = static_cast<backend*>(owner);
         if (!self->ring_.valid()) return false;
 
@@ -484,7 +521,8 @@ namespace FCS::Worker::backend::io_uring {
     // Cancels everything still in flight and reaps until every SQE has
     // produced its CQE. Only then is anything freed, so the kernel can never
     // complete into memory we've released.
-    inline void backend::shutdown_ring() noexcept {
+    template<typename Pool>
+    inline void backend<Pool>::shutdown_ring() noexcept {
         if (!ring_.valid()) return;
         (void)service_commands();
 
@@ -511,7 +549,8 @@ namespace FCS::Worker::backend::io_uring {
 
     // Registrations that never reached the ring (registered but never
     // driven), plus their commands. Anything still in flight is skipped.
-    inline void backend::discard_unarmed() noexcept {
+    template<typename Pool>
+    inline void backend<Pool>::discard_unarmed() noexcept {
         for (command* cmd = cmds_.take_all(); cmd != nullptr;) {
             command* next = cmd->next;
             delete cmd;

@@ -23,10 +23,18 @@ namespace FCS::Worker::detail {
 
     template<std::size_t Bytes>
     struct basic_queued_task {
+        // small scalars first, the task last: scheduling decisions read these without ever
+        // pulling the (large) task body into cache
         workload lane{};
         source_kind source{};
-        task_for<Bytes> invoke;
         task_priority priority{task_priority::normal};
+        task_for<Bytes> invoke;
+
+        basic_queued_task() noexcept = default;
+        // Parameter order is the historical one (lane, source, task, priority) -- it is only the
+        // member order that was rearranged for cache locality.
+        basic_queued_task(workload l, source_kind s, task_for<Bytes> t, task_priority p = task_priority::normal) noexcept
+            : lane(l), source(s), priority(p), invoke(std::move(t)) {}
     };
     using queued_task = basic_queued_task<default_task_bytes>;
 

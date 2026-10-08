@@ -80,9 +80,10 @@ namespace FCS::Worker::backend::iocp {
     // only once. Registering the second direction of a full-duplex socket
     // therefore sees ERROR_INVALID_PARAMETER from CreateIoCompletionPort and
     // treats it as "already associated with this backend's port".
-    class backend final : public generic_eventlooper<backend, HANDLE> {
+    template<typename Pool = pool_service<>>
+    class backend final : public generic_eventlooper<backend<Pool>, HANDLE, Pool> {
     public:
-        explicit backend(pool_service<>& service);
+        explicit backend(Pool& service);
         ~backend();
 
         backend(const backend&) = delete;
@@ -192,7 +193,8 @@ namespace FCS::Worker::backend::iocp {
         std::array<std::atomic<registration*>, capacity> slots_{};
     };
 
-    using eventlooper = backend;
+    using eventlooper = backend<pool_service<>>;
+    template<typename Pool> using basic_eventlooper = backend<Pool>;
 
 }
 
@@ -201,11 +203,14 @@ namespace FCS::Worker::backend::iocp {
 #else
 
 namespace FCS::Worker::backend::iocp {
-    class backend final : public generic_eventlooper<backend, void*> {
+    template<typename Pool = pool_service<>>
+    class backend final : public generic_eventlooper<backend<Pool>, void*, Pool> {
     public:
-        using generic_eventlooper<backend, void*>::generic_eventlooper;
+        using generic_eventlooper<backend<Pool>, void*, Pool>::generic_eventlooper;
     };
-    using eventlooper = backend;
+    using eventlooper = backend<pool_service<>>;
+    template<typename Pool> using basic_eventlooper = backend<Pool>;
+    template<typename Pool> using basic_eventlooper = backend<Pool>;
 }
 
 #endif

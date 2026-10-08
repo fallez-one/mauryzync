@@ -7,7 +7,8 @@ namespace FCS::Worker::backend::iocp {
 
     // ---------------------------------------------------------------- lifecycle
 
-    inline backend::backend(pool_service<>& service) : generic_eventlooper<backend, HANDLE>(service) {
+    template<typename Pool>
+    inline backend<Pool>::backend(Pool& service) : generic_eventlooper<backend<Pool>, HANDLE, Pool>(service) {
         // Created up front, not lazily: a registration may be made before
         // start() (datagram subscriptions aren't accept-gated), and every one
         // must land on the one port the driver will later watch.
@@ -15,30 +16,35 @@ namespace FCS::Worker::backend::iocp {
         if (!port_) setup_error_.store(static_cast<int>(::GetLastError()), std::memory_order_relaxed);
     }
 
-    inline backend::~backend() {
+    template<typename Pool>
+    inline backend<Pool>::~backend() {
         stop_backend();
         discard_unarmed();
         if (port_) ::CloseHandle(port_);
     }
 
-    inline void backend::start_backend() {
-        generic_eventlooper<backend, HANDLE>::start_backend();
+
+    template<typename Pool>
+    inline void backend<Pool>::start_backend() {
+        generic_eventlooper<backend<Pool>, HANDLE, Pool>::start_backend();
         bool expected = false;
         if (!polling_.compare_exchange_strong(expected, true)) return;
         if (!port_) { polling_.store(false, std::memory_order_release); return; }
 
         inflight_ = 0;
         stop_seen_ = false;
-        if (service().execution_policy() == execution::policy::dedicated_poller) {
+        if (this->service().execution_policy() == execution::policy::dedicated_poller) {
             poller_ = std::thread([this] { run_loop(); });
         } else {
             // execution::shared_worker -- no dedicated OS thread; ordinary
             // pool workers drive the port via poll_once() instead.
-            poll_hook_ = service().register_poll_hook(this, &backend::poll_once);
+            poll_hook_ = this->service().register_poll_hook(this, &backend::poll_once);
         }
     }
 
-    inline void backend::stop_backend() noexcept {
+
+    template<typename Pool>
+    inline void backend<Pool>::stop_backend() noexcept {
         const bool was_polling = polling_.exchange(false);
         if (poller_.joinable()) {
             // The definitive stop signal. run_loop() ends with shutdown_port(),
@@ -50,16 +56,18 @@ namespace FCS::Worker::backend::iocp {
             // before returning -- see poll_registry::unregister(). From here
             // this thread is the only driver, so it may run the shutdown
             // itself (pool workers may already be gone by now anyway).
-            service().unregister_poll_hook(poll_hook_);
+            this->service().unregister_poll_hook(poll_hook_);
             shutdown_port();
         }
-        generic_eventlooper<backend, HANDLE>::stop_backend();
+        generic_eventlooper<backend<Pool>, HANDLE, Pool>::stop_backend();
     }
 
     // ----------------------------------------------------------- any-thread API
 
+
+    template<typename Pool>
     template<typename Tag, std::size_t Size, common::recv_option Options, typename Reader, typename Source, typename Callback>
-    subscription backend::register_source(Source&& source, Reader&& reader, Callback&& callback) {
+    subscription backend<Pool>::register_source(Source&& source, Reader&& reader, Callback&& callback) {
         static_assert(reader_callable<Size, std::remove_cvref_t<Reader>, common::completed_source>,
                       "Reader must be callable with a detail::completed_source& and return read_result<Size>");
 
@@ -79,7 +87,7 @@ namespace FCS::Worker::backend::iocp {
         registration_ptr->buffer_size = Size;
         registration_ptr->buffer = std::make_unique<std::byte[]>(Size);
         registration_ptr->op.owner = registration_ptr;
-        registration_ptr->channel_subscription = service().template subscribe<Tag>(std::forward<Callback>(callback));
+        registration_ptr->channel_subscription = this->service().template subscribe<Tag>(std::forward<Callback>(callback));
         registration_ptr->on_event = [this, reader_fn = std::forward<Reader>(reader)](registration& reg, DWORD transferred, bool ok, DWORD error_code) mutable -> action {
             completion<Size> c{};
             c.user_data = reg.h.index;
@@ -114,7 +122,7 @@ namespace FCS::Worker::backend::iocp {
                 c.raw_status = static_cast<std::int64_t>(transferred);
             }
             c.completed_at = std::chrono::steady_clock::now();
-            (void)service().template post<Tag>(c);
+            (void)this->service().template post<Tag>(c);
             return next;
         };
 
@@ -128,8 +136,10 @@ namespace FCS::Worker::backend::iocp {
         return subscription{this, &backend::cancel_slot, table::pack(handle)};
     }
 
+
+    template<typename Pool>
     template<typename Tag, std::size_t Size, typename Writer, typename Sink, typename Callback>
-    subscription backend::register_sink(Sink&& sink, Writer&& writer, Callback&& callback) {
+    subscription backend<Pool>::register_sink(Sink&& sink, Writer&& writer, Callback&& callback) {
         static_assert(writer_callable<std::remove_cvref_t<Writer>, common::readiness_sink>,
                       "Writer must be callable with a detail::readiness_sink& and return a byte count");
 
@@ -154,7 +164,7 @@ namespace FCS::Worker::backend::iocp {
             registration_ptr->socket = native;
             registration_ptr->handle = common::to_iocp_handle(native);
             registration_ptr->op.owner = registration_ptr;
-            registration_ptr->channel_subscription = service().template subscribe<Tag>(std::forward<Callback>(callback));
+            registration_ptr->channel_subscription = this->service().template subscribe<Tag>(std::forward<Callback>(callback));
             registration_ptr->on_event = [this, writer_fn = std::forward<Writer>(writer)](registration& reg, DWORD, bool ok, DWORD error_code) mutable -> action {
                 completion<Size> c{};
                 c.user_data = reg.h.index;
@@ -168,7 +178,7 @@ namespace FCS::Worker::backend::iocp {
                     c.status = completion_status::error;
                     c.raw_status = static_cast<std::int64_t>(error_code);
                     c.error = common::from_native_error(error_code);
-                    (void)service().template post<Tag>(c);
+                    (void)this->service().template post<Tag>(c);
                     return action::retire;
                 }
 
@@ -188,7 +198,7 @@ namespace FCS::Worker::backend::iocp {
                     c.status = completion_status::ok;
                     c.raw_status = static_cast<std::int64_t>(written);
                 }
-                (void)service().template post<Tag>(c);
+                (void)this->service().template post<Tag>(c);
                 return next;
             };
 
@@ -206,7 +216,8 @@ namespace FCS::Worker::backend::iocp {
     // Associates a handle with the port. A second registration on the same
     // socket (the other duplex direction) is already associated; Windows
     // reports that as ERROR_INVALID_PARAMETER -- see the class comment.
-    inline bool backend::associate(HANDLE native) noexcept {
+    template<typename Pool>
+    inline bool backend<Pool>::associate(HANDLE native) noexcept {
         if (!port_) return false;
         if (::CreateIoCompletionPort(native, port_, 0, 0) != nullptr) return true;
         return ::GetLastError() == ERROR_INVALID_PARAMETER;
@@ -214,7 +225,8 @@ namespace FCS::Worker::backend::iocp {
 
     // Hands a fully-initialized registration to the driver. Only the store and
     // the posted command are visible to other threads.
-    inline bool backend::publish(registration* registration_ptr) noexcept {
+    template<typename Pool>
+    inline bool backend<Pool>::publish(registration* registration_ptr) noexcept {
         auto* cmd = new (std::nothrow) command{};
         if (!cmd) return false;
         cmd->what = command::kind::arm;
@@ -230,7 +242,9 @@ namespace FCS::Worker::backend::iocp {
         return true;
     }
 
-    inline void backend::post_command(command::kind what, table::handle h) noexcept {
+
+    template<typename Pool>
+    inline void backend<Pool>::post_command(command::kind what, table::handle h) noexcept {
         auto* cmd = new (std::nothrow) command{};
         if (cmd) {
             cmd->what = what;
@@ -249,7 +263,8 @@ namespace FCS::Worker::backend::iocp {
     // Never dereferences the registration: it may already have been freed by
     // the driver. All it does is the lock-free slot-state transition; the
     // driver does the rest when it sees the command.
-    inline bool backend::cancel_slot(void* owner, std::size_t packed) noexcept {
+    template<typename Pool>
+    inline bool backend<Pool>::cancel_slot(void* owner, std::size_t packed) noexcept {
         auto* self = static_cast<backend*>(owner);
         const auto h = table::unpack(packed);
         if (!self->slots_state_.request_cancel(h)) return false;
@@ -259,7 +274,9 @@ namespace FCS::Worker::backend::iocp {
 
     // ------------------------------------------------------------- driver side
 
-    inline bool backend::arm(registration& registration_ref) noexcept {
+
+    template<typename Pool>
+    inline bool backend<Pool>::arm(registration& registration_ref) noexcept {
         registration_ref.op = op_block{};
         registration_ref.op.owner = &registration_ref;
         registration_ref.submitted_at = std::chrono::steady_clock::now();
@@ -314,7 +331,9 @@ namespace FCS::Worker::backend::iocp {
         return pending;
     }
 
-    inline void backend::request_io_cancel(registration& registration_ref) noexcept {
+
+    template<typename Pool>
+    inline void backend<Pool>::request_io_cancel(registration& registration_ref) noexcept {
         if (registration_ref.cancel_sent) return;
         registration_ref.cancel_sent = true;
         (void)::CancelIoEx(registration_ref.handle, &registration_ref.op); // ERROR_NOT_FOUND = already completing; its packet is queued
@@ -323,7 +342,8 @@ namespace FCS::Worker::backend::iocp {
     // Frees a registration. Callers guarantee no operation for it is
     // outstanding -- that is what makes it safe to release the OVERLAPPED and
     // buffer the kernel was using, and to let the slot be claimed again.
-    inline void backend::finish(registration* registration_ptr, bool deliver_pending) noexcept {
+    template<typename Pool>
+    inline void backend<Pool>::finish(registration* registration_ptr, bool deliver_pending) noexcept {
         // See io_uring::backend::finish(): keep a just-posted terminal completion alive.
         if (deliver_pending) (void)registration_ptr->channel_subscription.retire();
         const auto h = registration_ptr->h;
@@ -333,7 +353,9 @@ namespace FCS::Worker::backend::iocp {
         slots_state_.release(h.index);
     }
 
-    inline void backend::handle_command(command* cmd) noexcept {
+
+    template<typename Pool>
+    inline void backend<Pool>::handle_command(command* cmd) noexcept {
         pending_commands_.fetch_sub(1, std::memory_order_relaxed);
         auto* registration_ptr = cmd->h.index < capacity ? slots_[cmd->h.index].load(std::memory_order_acquire) : nullptr;
         if (registration_ptr && same_generation(registration_ptr->h.generation, cmd->h.generation)) {
@@ -354,7 +376,8 @@ namespace FCS::Worker::backend::iocp {
     }
 
     // Fallback for a cancel command that couldn't be allocated or posted.
-    inline void backend::sweep_cancelled() noexcept {
+    template<typename Pool>
+    inline void backend<Pool>::sweep_cancelled() noexcept {
         for (auto& slot : slots_) {
             auto* registration_ptr = slot.load(std::memory_order_acquire);
             if (!registration_ptr || slots_state_.live(registration_ptr->h)) continue;
@@ -363,7 +386,9 @@ namespace FCS::Worker::backend::iocp {
         }
     }
 
-    inline void backend::handle_completion(op_block* op, DWORD transferred, LONG status) noexcept {
+
+    template<typename Pool>
+    inline void backend<Pool>::handle_completion(op_block* op, DWORD transferred, LONG status) noexcept {
         auto* registration_ptr = op->owner;
         if (inflight_ != 0) --inflight_;
         registration_ptr->in_flight = false;
@@ -398,7 +423,8 @@ namespace FCS::Worker::backend::iocp {
     }
 
     // Returns true if it did real work (a command or an I/O completion).
-    inline bool backend::handle_entry(const OVERLAPPED_ENTRY& entry) noexcept {
+    template<typename Pool>
+    inline bool backend<Pool>::handle_entry(const OVERLAPPED_ENTRY& entry) noexcept {
         if (entry.lpCompletionKey == key_stop) { stop_seen_ = true; return false; }
         if (entry.lpCompletionKey == key_command) {
             if (!entry.lpOverlapped) { // wake-only packet from a failed command allocation
@@ -414,7 +440,9 @@ namespace FCS::Worker::backend::iocp {
         return true;
     }
 
-    inline void backend::run_loop() {
+
+    template<typename Pool>
+    inline void backend<Pool>::run_loop() {
         std::array<OVERLAPPED_ENTRY, batch> entries{};
         unsigned failures = 0;
         while (!stop_seen_) {
@@ -438,7 +466,8 @@ namespace FCS::Worker::backend::iocp {
     // from some pool worker's own loop. poll_registry guarantees at most one
     // thread is inside this per backend at a time -- exactly the single-driver
     // contract the registrations need.
-    inline bool backend::poll_once(void* owner) noexcept {
+    template<typename Pool>
+    inline bool backend<Pool>::poll_once(void* owner) noexcept {
         auto* self = static_cast<backend*>(owner);
         if (!self->port_) return false;
 
@@ -453,7 +482,8 @@ namespace FCS::Worker::backend::iocp {
     // Cancels everything still in flight and reaps until every started
     // operation has produced its completion. Only then is anything freed, so
     // the kernel can never complete into memory we've released.
-    inline void backend::shutdown_port() noexcept {
+    template<typename Pool>
+    inline void backend<Pool>::shutdown_port() noexcept {
         if (!port_) return;
 
         for (auto& slot : slots_) {
@@ -479,7 +509,8 @@ namespace FCS::Worker::backend::iocp {
 
     // Registrations that never reached the port (registered but never
     // driven). Anything still in flight is skipped.
-    inline void backend::discard_unarmed() noexcept {
+    template<typename Pool>
+    inline void backend<Pool>::discard_unarmed() noexcept {
         for (auto& slot : slots_) {
             auto* registration_ptr = slot.load(std::memory_order_acquire);
             if (registration_ptr && !registration_ptr->in_flight) {

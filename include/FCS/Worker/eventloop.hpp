@@ -48,12 +48,15 @@ namespace FCS::Worker {
     // as-is: it wires the callback into the Tag channel without touching the native handle.
     // register_sink() is the same story for the write side, and stays this way for any
     // backend -- including epoll and, eventually, io_uring/IOCP -- until it defines its own.
-    template<typename Derived, typename Native>
+    // `Pool` is whichever pool_service<Capacity, Traits> instantiation the loop drives, so a pool with
+    // custom traits (task size, semaphore, timer capacity) works with every backend.
+    template<typename Derived, typename Native, typename Pool = pool_service<>>
     class generic_eventlooper : public eventloop_crtp<Derived> {
     public:
-        explicit generic_eventlooper(pool_service<>& service) noexcept : service_(&service) {}
+        using pool_type = Pool;
+        explicit generic_eventlooper(Pool& service) noexcept : service_(&service) {}
 
-        [[nodiscard]] pool_service<>& service() noexcept { return *service_; }
+        [[nodiscard]] Pool& service() noexcept { return *service_; }
         void start_backend() { service_->start(); }
         void stop_backend() noexcept { service_->stop(); }
 
@@ -75,7 +78,7 @@ namespace FCS::Worker {
         [[nodiscard]] std::size_t deliver(Args&&... args) { return post<Tag>(std::forward<Args>(args)...); }
 
     private:
-        pool_service<>* service_;
+        Pool* service_;
     };
 
 }

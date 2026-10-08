@@ -55,9 +55,10 @@ namespace FCS::Worker::backend::io_uring {
     //    kernel delivered its terminal completion, so the kernel can never
     //    write into a buffer that's been freed -- including at shutdown, which
     //    cancels and drains everything before anything is deleted.
-    class backend final : public generic_eventlooper<backend, int> {
+    template<typename Pool = pool_service<>>
+    class backend final : public generic_eventlooper<backend<Pool>, int, Pool> {
     public:
-        explicit backend(pool_service<>& service);
+        explicit backend(Pool& service);
         ~backend();
 
         backend(const backend&) = delete;
@@ -180,7 +181,8 @@ namespace FCS::Worker::backend::io_uring {
         common::mpsc_stack<command> cmds_;
     };
 
-    using eventlooper = backend;
+    using eventlooper = backend<pool_service<>>;
+    template<typename Pool> using basic_eventlooper = backend<Pool>;
 
 }
 
@@ -194,8 +196,11 @@ namespace FCS::Worker::backend::io_uring {
     // This Linux's uapi headers have no io_uring support at all (see
     // detail/io_uring_ring.hpp) — fall back to the epoll backend wholesale
     // rather than failing the build.
-    using backend = FCS::Worker::backend::epoll::backend;
-    using eventlooper = backend;
+    template<typename Pool = pool_service<>>
+    using backend = FCS::Worker::backend::epoll::backend<Pool>;
+    using eventlooper = backend<pool_service<>>;
+    template<typename Pool> using basic_eventlooper = backend<Pool>;
+    template<typename Pool> using basic_eventlooper = backend<Pool>;
 }
 
 #endif

@@ -8,7 +8,8 @@
 
 namespace FCS::Worker::backend::epoll {
 
-    inline backend::backend(pool_service<>& service) : generic_eventlooper<backend, int>(service) {
+    template<typename Pool>
+    inline backend<Pool>::backend(Pool& service) : generic_eventlooper<backend<Pool>, int, Pool>(service) {
         epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
         wakeup_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 
@@ -18,7 +19,8 @@ namespace FCS::Worker::backend::epoll {
         ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wakeup_fd_, &wake_event);
     }
 
-    inline backend::~backend() {
+    template<typename Pool>
+    inline backend<Pool>::~backend() {
         stop_backend();
         for (auto& slot : slots_) delete slot.load(std::memory_order_relaxed);
         for (auto* retired : retired_handlers_) delete retired;
@@ -26,31 +28,37 @@ namespace FCS::Worker::backend::epoll {
         if (wakeup_fd_ >= 0) ::close(wakeup_fd_);
     }
 
-    inline void backend::start_backend() {
-        generic_eventlooper<backend, int>::start_backend();
+
+    template<typename Pool>
+    inline void backend<Pool>::start_backend() {
+        generic_eventlooper<backend<Pool>, int, Pool>::start_backend();
         bool expected = false;
         if (!polling_.compare_exchange_strong(expected, true)) return;
-        if (service().execution_policy() == execution::policy::dedicated_poller) {
+        if (this->service().execution_policy() == execution::policy::dedicated_poller) {
             poller_ = std::thread([this] { run_loop(); });
         } else {
-            poll_hook_ = service().register_poll_hook(this, &backend::poll_once);
+            poll_hook_ = this->service().register_poll_hook(this, &backend::poll_once);
         }
     }
 
-    inline void backend::stop_backend() noexcept {
+
+    template<typename Pool>
+    inline void backend<Pool>::stop_backend() noexcept {
         if (polling_.exchange(false)) {
             if (poller_.joinable()) {
                 if (wakeup_fd_ >= 0) { std::uint64_t one{1}; (void)!::write(wakeup_fd_, &one, sizeof(one)); }
                 poller_.join();
             } else {
-                service().unregister_poll_hook(poll_hook_);
+                this->service().unregister_poll_hook(poll_hook_);
             }
             reclaim();
         }
-        generic_eventlooper<backend, int>::stop_backend();
+        generic_eventlooper<backend<Pool>, int, Pool>::stop_backend();
     }
 
-    inline backend::registration* backend::find_or_create_slot_locked(int fd, source_kind kind, std::size_t& index_out, bool& is_new) {
+
+    template<typename Pool>
+    inline typename backend<Pool>::registration* backend<Pool>::find_or_create_slot_locked(int fd, source_kind kind, std::size_t& index_out, bool& is_new) {
         for (std::size_t i = 0; i < capacity; ++i) {
             auto* ptr = slots_[i].load(std::memory_order_acquire);
             if (ptr && ptr->fd == fd && ptr->active.load(std::memory_order_acquire)) {
@@ -77,7 +85,9 @@ namespace FCS::Worker::backend::epoll {
         return nullptr;
     }
 
-    inline bool backend::update_interest(registration& reg, bool is_new) noexcept {
+
+    template<typename Pool>
+    inline bool backend<Pool>::update_interest(registration& reg, bool is_new) noexcept {
         ::epoll_event ev{};
         ev.events = (reg.read_active.load(std::memory_order_relaxed) ? static_cast<std::uint32_t>(EPOLLIN) : 0u)
                   | (reg.write_active.load(std::memory_order_relaxed) ? static_cast<std::uint32_t>(EPOLLOUT) : 0u);
@@ -85,7 +95,9 @@ namespace FCS::Worker::backend::epoll {
         return ::epoll_ctl(epoll_fd_, is_new ? EPOLL_CTL_ADD : EPOLL_CTL_MOD, reg.fd, &ev) == 0;
     }
 
-    inline void backend::publish_handler(std::atomic<handler*>& slot, ::FCS::Worker::detail::callback_function<void()> fn) {
+
+    template<typename Pool>
+    inline void backend<Pool>::publish_handler(std::atomic<handler*>& slot, ::FCS::Worker::detail::callback_function<void()> fn) {
         auto* fresh = new handler{std::move(fn)};
         if (auto* old = slot.exchange(fresh, std::memory_order_acq_rel)) {
             retired_handlers_.push_back(old);
@@ -93,13 +105,17 @@ namespace FCS::Worker::backend::epoll {
         }
     }
 
-    inline void backend::retire_direction(registration& reg, bool read) noexcept {
+
+    template<typename Pool>
+    inline void backend<Pool>::retire_direction(registration& reg, bool read) noexcept {
         std::lock_guard lock{slots_mutex_};
         (read ? reg.read_active : reg.write_active).store(false, std::memory_order_release);
         detach_direction(reg);
     }
 
-    inline void backend::detach_direction(registration& reg) noexcept {
+
+    template<typename Pool>
+    inline void backend<Pool>::detach_direction(registration& reg) noexcept {
         if (!reg.read_active.load(std::memory_order_acquire) && !reg.write_active.load(std::memory_order_acquire)) {
             reg.active.store(false, std::memory_order_release);
             scan_needed_.store(true, std::memory_order_release);
@@ -113,8 +129,10 @@ namespace FCS::Worker::backend::epoll {
         }
     }
 
+
+    template<typename Pool>
     template<typename Tag, std::size_t Size, detail::recv_option Options, typename Reader, typename Source, typename Callback>
-    subscription backend::register_source(Source&& source, Reader&& reader, Callback&& callback) {
+    subscription backend<Pool>::register_source(Source&& source, Reader&& reader, Callback&& callback) {
         static_assert(reader_callable<Size, std::remove_cvref_t<Reader>, detail::readiness_source<Options>>,
                       "Reader must be callable with a detail::readiness_source<Options>& and return read_result<Size>");
 
@@ -129,7 +147,7 @@ namespace FCS::Worker::backend::epoll {
         auto* registration_ptr = find_or_create_slot_locked(fd, kind, index, is_new);
         if (!registration_ptr) return {};
 
-        registration_ptr->read_channel_subscription = service().template subscribe<Tag>(std::forward<Callback>(callback));
+        registration_ptr->read_channel_subscription = this->service().template subscribe<Tag>(std::forward<Callback>(callback));
         publish_handler(registration_ptr->on_readable, [this, registration_ptr, reader_fn = std::forward<Reader>(reader)]() mutable {
             const auto submitted_at = std::chrono::steady_clock::now();
             detail::readiness_source<Options> src{registration_ptr->fd, registration_ptr->kind};
@@ -164,7 +182,7 @@ namespace FCS::Worker::backend::epoll {
             // even queued. read_ended makes that eventual free retire() rather
             // than cancel() the subscription.
             if (retire) registration_ptr->read_ended.store(true, std::memory_order_release);
-            (void)service().template post<Tag>(c);
+            (void)this->service().template post<Tag>(c);
             if (retire) retire_direction(*registration_ptr, /*read=*/true);
         });
 
@@ -178,8 +196,10 @@ namespace FCS::Worker::backend::epoll {
         return subscription{this, &backend::cancel_read_slot, index};
     }
 
+
+    template<typename Pool>
     template<typename Tag, std::size_t Size, typename Writer, typename Sink, typename Callback>
-    subscription backend::register_sink(Sink&& sink, Writer&& writer, Callback&& callback) {
+    subscription backend<Pool>::register_sink(Sink&& sink, Writer&& writer, Callback&& callback) {
         static_assert(writer_callable<std::remove_cvref_t<Writer>, detail::readiness_sink>,
                       "Writer must be callable with a detail::readiness_sink& and return a byte count");
 
@@ -192,7 +212,7 @@ namespace FCS::Worker::backend::epoll {
         auto* registration_ptr = find_or_create_slot_locked(fd, kind, index, is_new);
         if (!registration_ptr) return {};
 
-        registration_ptr->write_channel_subscription = service().template subscribe<Tag>(std::forward<Callback>(callback));
+        registration_ptr->write_channel_subscription = this->service().template subscribe<Tag>(std::forward<Callback>(callback));
         publish_handler(registration_ptr->on_writable, [this, registration_ptr, writer_fn = std::forward<Writer>(writer)]() mutable {
             const auto submitted_at = std::chrono::steady_clock::now();
             detail::readiness_sink snk{registration_ptr->fd, registration_ptr->kind};
@@ -219,7 +239,7 @@ namespace FCS::Worker::backend::epoll {
             }
 
             if (retire) registration_ptr->write_ended.store(true, std::memory_order_release);
-            (void)service().template post<Tag>(c);
+            (void)this->service().template post<Tag>(c);
             if (retire) retire_direction(*registration_ptr, /*read=*/false);
         });
 
@@ -233,7 +253,9 @@ namespace FCS::Worker::backend::epoll {
         return subscription{this, &backend::cancel_write_slot, index};
     }
 
-    inline bool backend::cancel_read_slot(void* owner, std::size_t slot) noexcept {
+
+    template<typename Pool>
+    inline bool backend<Pool>::cancel_read_slot(void* owner, std::size_t slot) noexcept {
         auto* self = static_cast<backend*>(owner);
         // Same reasoning as find_or_create_slot(): guards this dereference
         // against a concurrent reclaim() freeing the same registration.
@@ -248,7 +270,9 @@ namespace FCS::Worker::backend::epoll {
         return true;
     }
 
-    inline bool backend::cancel_write_slot(void* owner, std::size_t slot) noexcept {
+
+    template<typename Pool>
+    inline bool backend<Pool>::cancel_write_slot(void* owner, std::size_t slot) noexcept {
         auto* self = static_cast<backend*>(owner);
         std::lock_guard lock{self->slots_mutex_};
         auto* registration_ptr = self->slots_[slot].load(std::memory_order_acquire);
@@ -263,7 +287,8 @@ namespace FCS::Worker::backend::epoll {
     // Handles one epoll_event: retires whichever direction ERR/HUP leaves
     // without a clean signal of its own, then runs on_readable/on_writable
     // for whichever direction is both flagged ready and still active.
-    inline void backend::dispatch(registration& reg, std::uint32_t flags) noexcept {
+    template<typename Pool>
+    inline void backend<Pool>::dispatch(registration& reg, std::uint32_t flags) noexcept {
         if ((flags & (EPOLLERR | EPOLLHUP)) && !(flags & EPOLLIN) && reg.read_active.load(std::memory_order_acquire))
             retire_direction(reg, /*read=*/true);
         if ((flags & (EPOLLERR | EPOLLHUP)) && !(flags & EPOLLOUT) && reg.write_active.load(std::memory_order_acquire))
@@ -277,7 +302,9 @@ namespace FCS::Worker::backend::epoll {
             if (auto* h = reg.on_writable.load(std::memory_order_acquire)) h->fn();
     }
 
-    inline void backend::run_loop() {
+
+    template<typename Pool>
+    inline void backend<Pool>::run_loop() {
         std::array<::epoll_event, 64> events{};
         for (;;) {
             const auto count = ::epoll_wait(epoll_fd_, events.data(), static_cast<int>(events.size()), -1);
@@ -304,7 +331,9 @@ namespace FCS::Worker::backend::epoll {
         }
     }
 
-    inline bool backend::poll_once(void* owner) noexcept {
+
+    template<typename Pool>
+    inline bool backend<Pool>::poll_once(void* owner) noexcept {
         auto* self = static_cast<backend*>(owner);
         std::array<::epoll_event, 64> events{};
         const auto count = ::epoll_wait(self->epoll_fd_, events.data(), static_cast<int>(events.size()), 0);
@@ -329,7 +358,9 @@ namespace FCS::Worker::backend::epoll {
         return progressed;
     }
 
-    inline void backend::reclaim() noexcept {
+
+    template<typename Pool>
+    inline void backend<Pool>::reclaim() noexcept {
         // Only ever called by the single thread that's dispatching for this
         // backend, *between* batches (or after it has stopped), so nothing freed
         // here can be mid-dispatch. The early-out keeps the common case -- called

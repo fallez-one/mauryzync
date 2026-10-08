@@ -167,7 +167,7 @@ struct any_reader {
     }
 };
 
-struct tag_stream {}; struct tag_sink {}; struct tag_peek {}; struct tag_dgram {}; struct tag_churn {}; struct tag_stop_r {}; struct tag_stop_w {};
+struct tag_custom {}; struct tag_stream {}; struct tag_sink {}; struct tag_peek {}; struct tag_dgram {}; struct tag_churn {}; struct tag_stop_r {}; struct tag_stop_w {};
 
 struct counters {
     std::atomic<std::uint64_t> ok{0}, bytes{0}, closed{0}, errors{0}, checksum{0};
@@ -399,6 +399,37 @@ void run_all(W::execution::policy policy, const char* name) {
     service.stop();
 }
 
+
+// A pool with NON-default traits (64-byte tasks, so the 256-byte read completions below take the
+// boxed path) driven by the same backend: the backend is a template on the pool type.
+struct small_task_traits : W::default_pool_traits { static constexpr std::size_t task_bytes = 64; };
+
+void test_custom_traits_pool() {
+    std::printf("== backend on a pool with custom traits\n");
+    using pool_t = W::pool_service<1024, small_task_traits>;
+    pool_t pool;
+    pool.concurrency(3).start();
+    {
+        W::basic_eventlooper<pool_t> loop{pool};
+        loop.start();
+        auto p = make_pair();
+        auto c = std::make_shared<counters>();
+        auto sub = loop.subscribe<tag_custom, chunk>(W::source_ref<sock_t>{p.a, W::source_kind::network}, any_reader{},
+                                                            [c](W::completion<chunk> r) { c->take(r); });
+        CHECK(sub.active());
+        std::uint64_t expect = 0;
+        for (int i = 0; i < 20; ++i) { CHECK(send_bytes(p.b, "0123456789", 10) == 10); expect += 10; std::this_thread::sleep_for(2ms); }
+        CHECK(wait_for([&] { return c->bytes.load() == expect; }));
+        shutdown_write(p.b);
+        CHECK(wait_for([&] { return c->closed.load() == 1; }));
+        CHECK(c->errors.load() == 0);
+        loop.stop();
+        close_pair(p);
+        flush_closes();
+    }
+    pool.stop();
+}
+
 } // namespace
 
 int main() {
@@ -408,6 +439,7 @@ int main() {
 #endif
     run_all(W::execution::shared_worker, "shared_worker");
     run_all(W::execution::dedicated_poller, "dedicated_poller");
+    test_custom_traits_pool();
 #if defined(_WIN32)
     ::WSACleanup();
 #endif
