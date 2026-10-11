@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../experimental.hpp"
 #include "cpu_relax.hpp"
 
 #include <array>
@@ -93,6 +94,12 @@ namespace FCS::Worker::detail {
         }
 
         [[nodiscard]] std::size_t size() const noexcept { const guard lock{const_cast<timer_heap&>(*this)}; return size_; }
+
+#if FCS_EXPERIMENTAL_ALWAYS_ON
+        // In a clone: the thread that held the spin lock does not exist there. (The pending
+        // timers themselves are kept -- the deadlines are steady_clock ticks, which a clone shares.)
+        void release_lock_after_clone() noexcept { lock_.store(false, std::memory_order_relaxed); }
+#endif
 
     private:
         struct entry {

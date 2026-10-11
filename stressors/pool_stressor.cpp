@@ -31,7 +31,6 @@
 // Defaults are intentionally harsh; pass smaller numbers for a quick smoke run.
 
 #include <FCS/Worker/workers.hpp>
-#include <mutex>
 
 #include <algorithm>
 #include <array>
@@ -53,6 +52,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <mutex>
 
 #if defined(_WIN32)
 #  ifndef WIN32_LEAN_AND_MEAN

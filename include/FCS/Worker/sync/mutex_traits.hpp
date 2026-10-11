@@ -1,6 +1,7 @@
 #ifndef FCS_SYNC_MUTEX_TRAITS
 #define FCS_SYNC_MUTEX_TRAITS
 #include <concepts>
+#include <cstdint>
 
 namespace FCS::synchronization {
 template<typename T>

@@ -1,10 +1,12 @@
 #pragma once
 
+#include "../experimental.hpp"
 #include "mpmc_queue.hpp"
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <type_traits>
 
 namespace FCS::Worker::detail {
@@ -80,6 +82,17 @@ namespace FCS::Worker::detail {
             skipped_.store(0, std::memory_order_relaxed);
             return normal_.try_pop(value) || high_.try_pop(value);
         }
+
+#if FCS_EXPERIMENTAL_ALWAYS_ON
+        // In a clone: a producer frozen between claiming a slot and publishing it leaves a hole
+        // consumers can never pass, so both lanes are rebuilt (old storage leaked); the aging
+        // policy is kept.
+        void reset_after_clone() noexcept {
+            std::construct_at(&high_);
+            std::construct_at(&normal_);
+            skipped_.store(0, std::memory_order_relaxed);
+        }
+#endif
 
     private:
         static constexpr std::uint64_t segment_size = 32;

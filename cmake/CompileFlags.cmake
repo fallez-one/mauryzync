@@ -37,6 +37,10 @@ function(SERVER_OPTIMIZE program_target scope)
         else()
             target_compile_options(${program_target} ${scope} "$<$<CONFIG:Debug>:/Zi>")
         endif()
+
+        # Suppress noisy padding alignment specifier warning
+        target_compile_options(${program_target} ${scope} "/wd4324")
+
         target_link_options(${program_target} ${scope}
             /DEBUG
             /INCREMENTAL:NO

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "experimental.hpp"
 #include "async_completed_result.hpp"
 #include "detail/admission_gate.hpp"
 #include "detail/channel.hpp"
@@ -9,6 +10,8 @@
 #include "detail/poll_registry.hpp"
 #include "detail/priority_mpmc_queue.hpp"
 #include "detail/scheduled_result.hpp"
+#include "detail/resurrection_metrics.hpp"
+#include "detail/shed_migration.hpp"
 #include "detail/scheduler_metrics.hpp"
 #include "detail/task.hpp"
 #include "detail/timer_heap.hpp"
@@ -18,6 +21,9 @@
 #include "cooperative.hpp"
 #include "execution.hpp"
 #include "types.hpp"
+#if FCS_EXPERIMENTAL_ALWAYS_ON
+#  include "detail/process_resurrect.hpp"
+#endif
 
 #include <atomic>
 #include <cstdio>
@@ -119,6 +125,68 @@ namespace FCS::Worker {
 
         pool_service& watchdog_interval(std::chrono::nanoseconds interval = std::chrono::milliseconds{5}) noexcept;
         pool_service& watchdog_mark_stall(std::chrono::nanoseconds tolerance = std::chrono::milliseconds{10}) noexcept;
+
+        // ---- total stall: poll, then shed (experimental; FCS_EXPERIMENTAL_ALWAYS_ON) ----------
+        //
+        // Rescuing hostage work from ONE wedged worker is the stall watchdog's job (above). This
+        // is for when EVERY worker is stalled at once and nobody is left to rescue anything: the
+        // pool can't tell "all descheduled" (starved of CPU, a stopped VM, a debugger) from "all
+        // truly wedged" (a deadlock, a task that never returns).
+        //
+        //   watchdog_total_stall_poll(window, quorum)
+        //     When the watchdog sees every worker stalled it asks for proof of life: it needs
+        //     `quorum` DISTINCT workers to make progress (finish or start a task) within
+        //     `window` -- chrono literals work: (500ms, 2), (3s, 1). That many do: it was
+        //     descheduling, the watchdog stands down and nothing happens. Fewer: it escalates to
+        //     a RUNTIME SHED. `window` <= 0 disables the whole thing. Arms at start() (that is
+        //     when the evacuation array is allocated -- not while already wedged); `window` and
+        //     `quorum` can be retuned afterwards.
+        //
+        //   Runtime shed -- the point of no return:
+        //     1. the shedding_migration() flag goes up. A worker that was merely descheduled and
+        //        wakes up late sees it, touches nothing, and parks until stop() joins it. For a
+        //        truly wedged worker the flag is irrelevant: it never looks. From now on
+        //        submit() refuses (enqueue() returns false): work accepted now would be lost.
+        //     2. every queue -- each worker's deque, the fast and slow lanes, the cushion and its
+        //        refill staging -- is MOVED (not copied) into one bounded 2-D array (see
+        //        detail/shed_migration.hpp).
+        //     3. the process is cloned (fork / RtlCloneUserProcess; Traits::resurrector, the
+        //        native one by default). Only the watchdog thread exists in the clone.
+        //     4. In the CLONE: the pool's runtime state is rebuilt, the hook below runs, the
+        //        tasks are re-injected -- straight into the worker's own deque where possible,
+        //        else through the cushion, else straight into the fast/slow lane -- and fresh
+        //        workers start. The cloned thread carries on as the new pool's watchdog.
+        //        In the PARENT: sleep watchdog_finalize_wait(), then resurrector.exit().
+        //     If the clone itself fails the shed is undone: tasks go back in through the shared
+        //     queues, the flag drops, the stood-down workers resume.
+        //
+        //   watchdog_on_migrate(fn)    fn(migration_context&), runs in the clone, see above. Before start().
+        //   watchdog_finalize_wait(ms) how long the parent lingers after cloning before it exits (default 0).
+        //
+        // Disabled build (FCS_EXPERIMENTAL_ALWAYS_ON=0): all three exist and do nothing.
+        using migration_context = detail::migration_context<queued_task_type>;
+        using migration_hook = detail::inline_function<void(migration_context&), Traits::callback_bytes>;
+#if FCS_EXPERIMENTAL_ALWAYS_ON
+        pool_service& watchdog_total_stall_poll(std::chrono::nanoseconds window, std::size_t quorum) noexcept;
+        pool_service& watchdog_finalize_wait(std::chrono::milliseconds wait) noexcept;
+        template<typename F>
+        pool_service& watchdog_on_migrate(F&& fn);
+        // True from the point of no return until the parent exits (or a failed clone is undone).
+        [[nodiscard]] bool shedding_migration() const noexcept { return shedding_migration_.load(std::memory_order_acquire); }
+        // What the last shed evacuated / re-injected. Read it when the pool is quiet (in the hook,
+        // or after a failed clone): the shedding thread writes it without synchronisation.
+        [[nodiscard]] detail::migration_report last_migration_report() const noexcept { return shed_report_; }
+        // Telemetry of polls, sheds and resurrections -- see detail/resurrection_metrics.hpp.
+        [[nodiscard]] detail::resurrection_snapshot resurrection_stats() const noexcept { return resurrection_.snapshot(); }
+#else
+        pool_service& watchdog_total_stall_poll(std::chrono::nanoseconds, std::size_t) noexcept { return *this; }
+        pool_service& watchdog_finalize_wait(std::chrono::milliseconds) noexcept { return *this; }
+        template<typename F>
+        pool_service& watchdog_on_migrate(F&&) noexcept { return *this; }
+        [[nodiscard]] bool shedding_migration() const noexcept { return false; }
+        [[nodiscard]] detail::migration_report last_migration_report() const noexcept { return {}; }
+        [[nodiscard]] detail::resurrection_snapshot resurrection_stats() const noexcept { return {}; }
+#endif
 
         // Steal-sizing idle estimate: how many steal attempts may reuse one
         // O(threads) scan before it is refreshed (default max(threads, 4); 0 =
@@ -281,6 +349,29 @@ namespace FCS::Worker {
         void signal_one() noexcept;   // new work: wake at most one sleeping worker
         void signal_all() noexcept;   // pool shape changed: every sleeper re-evaluates
         void watchdog_loop();
+        void launch_workers();
+        void launch_watchdog();
+
+#if FCS_EXPERIMENTAL_ALWAYS_ON
+        // Total-stall shed -- all defined in pool_service_shed.inl.
+        struct submit_flight {
+            explicit submit_flight(std::atomic<std::uint32_t>& n) noexcept : count(n) { count.fetch_add(1, std::memory_order_seq_cst); }
+            ~submit_flight() { count.fetch_sub(1, std::memory_order_release); }
+            submit_flight(const submit_flight&) = delete;
+            submit_flight& operator=(const submit_flight&) = delete;
+            std::atomic<std::uint32_t>& count;
+        };
+        [[nodiscard]] bool total_stall_armed() const noexcept { return shed_batch_ != nullptr && shed_window_ns_.load(std::memory_order_relaxed) > 0; }
+        void escalate_total_stall();                // watchdog thread: poll, then (maybe) shed. Does not return in the parent of a successful clone.
+        void await_stand_down();
+        void await_submitters();
+        void evacuate_all();
+        void reinject_all(bool direct_local);
+        void abort_shed();                          // the clone failed: undo
+        void resume_in_clone(std::uint64_t shed_ns) noexcept;            // the clone: rebuild, hook, re-inject, restart workers
+        void stop_after_commit() noexcept;
+        [[nodiscard]] bool shed_stand_down(std::size_t id);   // worker: false == pool is stopping, leave the loop
+#endif
 
         // Pops and runs one due entry from timers_, if any; false if none
         // was due. time_until_next_timer() is the read-only counterpart
@@ -422,6 +513,28 @@ namespace FCS::Worker {
         std::atomic_bool watchdog_parked_{};
         detail::parker<semaphore_type> watchdog_parker_;
         std::thread watchdog_;
+
+#if FCS_EXPERIMENTAL_ALWAYS_ON
+        // Total-stall shed state. Configuration is atomic (retunable anytime); the hook is plain
+        // (set before start()); the rest belongs to the watchdog thread, then to the clone.
+        using resurrector_type = detail::resurrector_of_t<Traits>;
+        std::atomic<std::int64_t> shed_window_ns_{0};
+        std::atomic<std::size_t> shed_quorum_{1};
+        std::atomic<std::int64_t> shed_finalize_ms_{0};
+        std::atomic_bool shedding_migration_{};     // the flag: set at the point of no return
+        std::atomic_bool migration_committed_{};    // parent only: the clone exists, this process is on its way out
+        std::array<std::atomic_bool, max_workers> shed_acked_{};   // worker i has seen the flag and stood down
+        // submit() callers between "checked the flag" and "pushed": the shed waits for them to drain
+        // before it sweeps, or a task could land in a layer already swept.
+        std::atomic<std::uint32_t> submits_in_flight_{0};
+        detail::resurrection_metrics resurrection_;
+        migration_hook migrate_hook_;
+        std::unique_ptr<detail::migration_batch<queued_task_type>> shed_batch_;   // allocated at start() when armed
+        detail::migration_report shed_report_{};
+        bool shed_holds_drain_{false};
+        bool shed_holds_refill_{false};
+        resurrector_type resurrector_{};
+#endif
 
         // Not on the hot submit path (that's fast_/slow_/cushion, all
         // lock-free), so a plain mutex here is fine -- enqueue_until() is

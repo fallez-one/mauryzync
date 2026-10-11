@@ -18,11 +18,18 @@ if(FCS_WORKER_IS_TOP_LEVEL)
 	set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 endif()
 
+# Experimental "always on" total-stall poll + runtime shed (pool_service::watchdog_total_stall_poll).
+# OFF: the calls exist and do nothing. See include/FCS/Worker/experimental.hpp.
+option(FCS_EXPERIMENTAL_ALWAYS_ON "Enable the experimental total-stall poll / runtime shed (fork-based resurrection)" OFF)
+
 find_package(Threads REQUIRED)
 
 add_library(FCS-Workers INTERFACE)
 target_include_directories(FCS-Workers INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(FCS-Workers INTERFACE Threads::Threads)
+if(FCS_EXPERIMENTAL_ALWAYS_ON)
+    target_compile_definitions(FCS-Workers INTERFACE FCS_EXPERIMENTAL_ALWAYS_ON=1)
+endif()
 
 if(WIN32)
     target_compile_definitions(FCS-Workers INTERFACE FCS_WORKER_BACKEND_IOCP=1 NOMINMAX)
@@ -35,7 +42,7 @@ else()
         include(cmake/ProbeIoUring.cmake)
         fcs_probe_io_uring(_fcs_io_uring_ok)
         if(NOT _fcs_io_uring_ok)
-            message(WARNING "FCS_USE_IO_URNIG=ON but the io_uring probe failed here; falling back to the epoll backend "
+            message(WARNING "FCS_USE_IO_URING=ON but the io_uring probe failed here; falling back to the epoll backend "
                             "(pass -DFCS_IO_URING_PROBE=OFF to force io_uring anyway)")
             set(_fcs_use_io_uring OFF)
         endif()
@@ -93,6 +100,14 @@ target_link_libraries(fcs_workers_pool_traits_test PRIVATE FCS-Workers)
 add_executable(fcs_workers_interruptible_mutex_test tests/interruptible_mutex_test.cpp)
 target_link_libraries(fcs_workers_interruptible_mutex_test PRIVATE FCS-Workers)
 
+# Mutex stressor: exclusion / interrupt storm / fairness / cancel-all, with a hang detector.
+add_executable(fcs_workers_mutex_stress stressors/mutex_stress.cpp)
+target_link_libraries(fcs_workers_mutex_stress PRIVATE FCS-Workers)
+
+# FIFO ticket mutex with interruptible acquirers (sync/ordered_mutex.hpp).
+add_executable(fcs_workers_ordered_mutex_test tests/ordered_mutex_test.cpp)
+target_link_libraries(fcs_workers_ordered_mutex_test PRIVATE FCS-Workers)
+
 # Bounded O(log N) timer min-heap (replaced an unbounded mutex-guarded one).
 add_executable(fcs_workers_timer_heap_test tests/timer_heap_test.cpp)
 target_link_libraries(fcs_workers_timer_heap_test PRIVATE FCS-Workers)
@@ -136,4 +151,21 @@ target_link_libraries(fcs_workers_backend_bench PRIVATE FCS-Workers)
 if(NOT WIN32)
     add_executable(fcs_workers_dispatch_race tests/dispatch_race.cpp)
     target_link_libraries(fcs_workers_dispatch_race PRIVATE FCS-Workers)
+endif()
+
+# Total-stall poll + runtime shed. The ON build always exists (it forces the macro for itself);
+# the OFF build -- the three calls are inert -- exists whenever the global option is off.
+add_executable(fcs_workers_total_stall_shed_test tests/total_stall_shed_test.cpp)
+target_link_libraries(fcs_workers_total_stall_shed_test PRIVATE FCS-Workers)
+target_compile_definitions(fcs_workers_total_stall_shed_test PRIVATE FCS_EXPERIMENTAL_ALWAYS_ON=1)
+if(NOT FCS_EXPERIMENTAL_ALWAYS_ON)
+    add_executable(fcs_workers_total_stall_shed_off_test tests/total_stall_shed_test.cpp)
+    target_link_libraries(fcs_workers_total_stall_shed_off_test PRIVATE FCS-Workers)
+endif()
+
+# Stress test for the same: rollback storms, a multi-generation fork chain, and whole-process pauses.
+if(NOT WIN32)
+    add_executable(fcs_workers_shed_stress stressors/shed_stress.cpp)
+    target_link_libraries(fcs_workers_shed_stress PRIVATE FCS-Workers)
+    target_compile_definitions(fcs_workers_shed_stress PRIVATE FCS_EXPERIMENTAL_ALWAYS_ON=1)
 endif()

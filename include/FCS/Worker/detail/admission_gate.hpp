@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../experimental.hpp"
 #include "mpmc_queue.hpp"
 #include "queue_classifier.hpp"
 #include "scheduler_metrics.hpp"
@@ -43,6 +44,30 @@ namespace FCS::Worker::detail {
         [[nodiscard]] queue_state cushion_state() const noexcept;
         [[nodiscard]] queue_state admission_state() const noexcept;
 
+#if FCS_EXPERIMENTAL_ALWAYS_ON
+        // ---- total-stall shed support (see pool_service_shed.inl); definitions: admission_gate_shed.inl ----
+
+        // The refill claim doubles as ownership of the staging array: hold it and no worker can
+        // refill() -- nothing moves from the cushion into the fast/slow lanes behind a sweep.
+        // False when a (possibly wedged) worker holds it.
+        [[nodiscard]] bool claim_refill() noexcept { bool expected = false; return refilling_.compare_exchange_strong(expected, true, std::memory_order_acq_rel); }
+        void release_refill() noexcept { refilling_.store(false, std::memory_order_release); }
+
+        // Both need claim_refill() to have succeeded (pending only) and share evacuate_local's
+        // room()/put() protocol. The staging array is the OLDER of the two, hence its own call.
+        template<typename Room, typename Put>
+        std::size_t evacuate_pending(scheduler_metrics& metrics, Room&& room, Put&& put);
+        template<typename Room, typename Put>
+        std::size_t evacuate_cushion(scheduler_metrics& metrics, Room&& room, Put&& put);
+
+        // Puts an already-admitted task back into the cushion: no submit accounting, no priority
+        // reserve. Fails only when the cushion is physically full, and then leaves `work` alone.
+        [[nodiscard]] bool readmit(QueuedTask& work, scheduler_metrics& metrics) noexcept;
+
+        // In the clone: cushion, staging and flags rebuilt (old ones leaked); thresholds kept.
+        void reset_after_clone() noexcept;
+#endif
+
     private:
         bounded_mpmc_queue<QueuedTask, CushionCapacity> cushion_;
         std::array<std::optional<QueuedTask>, CushionCapacity> pending_{};
@@ -61,3 +86,6 @@ namespace FCS::Worker::detail {
 }
 
 #include "admission_gate.inl"
+#if FCS_EXPERIMENTAL_ALWAYS_ON
+#  include "admission_gate_shed.inl"
+#endif

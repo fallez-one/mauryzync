@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../experimental.hpp"
 #include "hazard_domain.hpp"
 #include "idle_estimate.hpp"
 #include "mpmc_queue.hpp"
@@ -63,6 +64,7 @@ namespace FCS::Worker::detail {
         struct stall_scan {
             std::size_t busy{};           // workers currently inside a task
             std::size_t newly_stalled{};  // workers this pass flagged for the first time
+            std::size_t stalled{};        // workers flagged stalled right now (newly or not)
         };
 
         // One watchdog pass at time `now`. Flags workers whose current task has
@@ -119,10 +121,48 @@ namespace FCS::Worker::detail {
         // Per-worker steal telemetry — see worker_profile.hpp for field meanings.
         [[nodiscard]] worker_steal_snapshot profile(std::size_t id) const noexcept;
 
+#if FCS_EXPERIMENTAL_ALWAYS_ON
+        // ---- total-stall shed support (see pool_service::watchdog_total_stall_poll) ----
+        // Definitions: worker_registry_shed.inl.
+
+        // Proof-of-life polling. A worker's tick moves whenever it enters or leaves a task, so a
+        // tick that differs from the one recorded at the start of a poll is a worker that ran.
+        struct progress_marks { std::array<std::uint64_t, MaxWorkers> tick{}; };
+        void mark_progress(progress_marks& marks) const noexcept;
+        [[nodiscard]] std::size_t progressed_since(const progress_marks& marks) const noexcept;
+        [[nodiscard]] bool in_task(std::size_t id) const noexcept { return (locals_[id].tick.load(std::memory_order_acquire) & 1u) != 0; }
+
+        // Takes over the global-to-local drain claim (and gives it back). Held through a shed, it
+        // stops a late worker from shuffling tasks from the shared queues into a deque that has
+        // already been swept.
+        [[nodiscard]] bool claim_drain() noexcept { bool expected = false; return draining_.compare_exchange_strong(expected, true, std::memory_order_acq_rel); }
+        void release_drain() noexcept { draining_.store(false, std::memory_order_release); }
+
+        // Moves everything out of worker `id`'s deque as a thief (oldest first), through the
+        // watchdog's own hazard slot, so the owner -- running, descheduled or wedged -- is never
+        // asked for anything. `room()` is asked before each take and `put(QueuedTask&&)` receives
+        // the task; a false `room()` ends the sweep with the rest still queued. Returns the count.
+        template<typename Room, typename Put>
+        std::size_t evacuate_local(std::size_t id, scheduler_metrics& metrics, Room&& room, Put&& put);
+
+        // Puts `task` on the bottom of worker `id`'s deque. ONLY while no thread owns that deque
+        // (a clone, before its workers start). False, task untouched, once the deque holds LocalCapacity.
+        [[nodiscard]] bool inject_local(std::size_t id, QueuedTask&& work, scheduler_metrics& metrics);
+
+        // In the clone: every deque, the hazard slots and the claims are rebuilt from scratch.
+        // The old objects are LEAKED rather than destroyed -- their owner may have been frozen
+        // half-way through a push, and tearing down half-written bookkeeping is how a rescue
+        // would crash.
+        void reset_after_clone() noexcept;
+#endif
+
     private:
         static constexpr std::size_t segment_capacity = 128;
-        using local_queue = segmented_deque<QueuedTask, segment_capacity, MaxWorkers>;
-        using hazards_type = hazard_domain<MaxWorkers>;
+        // With the shed enabled the hazard domain has one extra slot, beyond every worker's: the
+        // watchdog's, used when it sweeps a deque as a thief.
+        static constexpr std::size_t hazard_slots = MaxWorkers + (FCS_EXPERIMENTAL_ALWAYS_ON ? 1 : 0);
+        using local_queue = segmented_deque<QueuedTask, segment_capacity, hazard_slots>;
+        using hazards_type = hazard_domain<hazard_slots>;
 
         struct worker_slot {
             local_queue queue;
@@ -155,3 +195,6 @@ namespace FCS::Worker::detail {
 }
 
 #include "worker_registry.inl"
+#if FCS_EXPERIMENTAL_ALWAYS_ON
+#  include "worker_registry_shed.inl"
+#endif

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "detail/queue_classifier.hpp"
+#include "experimental.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -85,8 +86,26 @@ namespace FCS::Worker {
         if (!running_.compare_exchange_strong(expected, true)) return;
         registry_.configure(threads_);
         parking_.configure(threads_);
+#if FCS_EXPERIMENTAL_ALWAYS_ON
+        // Armed here, not when the pool is already wedged: the evacuation array is the one big
+        // allocation of a shed. (Raw storage -- untouched pages cost nothing.)
+        if (shed_window_ns_.load(std::memory_order_relaxed) > 0 && watchdog_interval_ns_.load(std::memory_order_relaxed) > 0) {
+            shed_batch_ = std::make_unique<detail::migration_batch<queued_task_type>>();
+            shed_batch_->configure(threads_, local_capacity);
+        }
+#endif
+        launch_workers();
+        launch_watchdog();
+    }
+
+    template<std::size_t QueueCapacity, typename Traits>
+    void pool_service<QueueCapacity, Traits>::launch_workers() {
         workers_.reserve(threads_);
         for (std::size_t i{}; i < threads_; ++i) workers_.emplace_back([this, i] { worker_loop(i); });
+    }
+
+    template<std::size_t QueueCapacity, typename Traits>
+    void pool_service<QueueCapacity, Traits>::launch_watchdog() {
         watchdog_stop_.store(false, std::memory_order_relaxed);
         if (watchdog_interval_ns_.load(std::memory_order_relaxed) > 0) watchdog_ = std::thread([this] { watchdog_loop(); });
     }
@@ -95,6 +114,9 @@ namespace FCS::Worker {
     void pool_service<QueueCapacity, Traits>::stop() noexcept {
         if (!running_.exchange(false)) return;
         signal_all();
+#if FCS_EXPERIMENTAL_ALWAYS_ON
+        if (migration_committed_.load(std::memory_order_acquire)) { stop_after_commit(); return; }
+#endif
         for (auto& thread : workers_) if (thread.joinable()) thread.join();
         workers_.clear();
         // Only after the workers are gone: they may still be draining queued work
@@ -306,6 +328,13 @@ namespace FCS::Worker {
 
     template<std::size_t QueueCapacity, typename Traits>
     bool pool_service<QueueCapacity, Traits>::submit(queued_task_type work) {
+#if FCS_EXPERIMENTAL_ALWAYS_ON
+        // Anything accepted after the evacuation would be lost with this process: refuse it.
+        // Announce first, check second (seq_cst both): either the shed sees this submit in flight
+        // and waits for it, or this submit sees the flag.
+        const submit_flight flight{submits_in_flight_};
+        if (shedding_migration_.load(std::memory_order_seq_cst)) { metrics_.record_rejected(); resurrection_.submits_refused.fetch_add(1, std::memory_order_relaxed); return false; }
+#endif
         if (!gate_.submit(std::move(work), metrics_)) return false;
         signal_one();
         return true;
@@ -313,6 +342,10 @@ namespace FCS::Worker {
 
     template<std::size_t QueueCapacity, typename Traits>
     bool pool_service<QueueCapacity, Traits>::submit_direct(queued_task_type work) {
+#if FCS_EXPERIMENTAL_ALWAYS_ON
+        const submit_flight flight{submits_in_flight_};
+        if (shedding_migration_.load(std::memory_order_seq_cst)) { metrics_.record_rejected(); resurrection_.submits_refused.fetch_add(1, std::memory_order_relaxed); return false; }
+#endif
         const auto source = work.source;
         if (!fast_.try_push(std::move(work))) { metrics_.record_rejected(); return false; }
         metrics_.record_submit(source);
@@ -369,6 +402,13 @@ namespace FCS::Worker {
         unsigned idle_rounds = 0;
 
         while (running_ || queued()) {
+#if FCS_EXPERIMENTAL_ALWAYS_ON
+            // Point of no return reached: this worker was only descheduled. Touch nothing.
+            if (shedding_migration_.load(std::memory_order_acquire)) {
+                if (!shed_stand_down(id)) break;
+                continue;
+            }
+#endif
             if (registry_.take_local(id, work, metrics_) || registry_.steal(id, work, metrics_, minimum_steal_depth)) {
                 idle_rounds = 0;
                 {
@@ -491,6 +531,15 @@ namespace FCS::Worker {
             // the hostage work is actually picked up now, not whenever the next
             // submit happens to rouse them.
             if (scan.newly_stalled != 0) signal_all();
+#if FCS_EXPERIMENTAL_ALWAYS_ON
+            // Every worker stalled: nobody is left to rescue anything. Ask for proof of life,
+            // shed if none comes (see watchdog_total_stall_poll()). In the clone of a successful
+            // shed this returns too -- this thread then carries on as the new pool's watchdog.
+            if (scan.stalled != 0 && scan.stalled >= registry_.thread_count() && total_stall_armed()) {
+                escalate_total_stall();
+                continue;
+            }
+#endif
 
             if (scan.busy != 0) {
                 watchdog_parker_.park(interval, stopping);
@@ -535,3 +584,7 @@ namespace FCS::Worker {
 
 
 }
+
+#if FCS_EXPERIMENTAL_ALWAYS_ON
+#  include "pool_service_shed.inl"
+#endif

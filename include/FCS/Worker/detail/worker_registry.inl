@@ -99,6 +99,7 @@ namespace FCS::Worker::detail {
                 slot.profile.record_stalled();
                 ++result.newly_stalled;
             }
+            if (slot.stalled.load(std::memory_order_relaxed)) ++result.stalled;
         }
         return result;
     }

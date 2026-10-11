@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../execution.hpp"
+#include "../experimental.hpp"
 
 #include <array>
 #include <atomic>
@@ -94,6 +95,12 @@ namespace FCS::Worker::detail {
         }
 
         [[nodiscard]] bool empty() const noexcept { return count_.load(std::memory_order_relaxed) == 0; }
+
+#if FCS_EXPERIMENTAL_ALWAYS_ON
+        // In a clone: a hook is still `busy` if the worker polling it was frozen mid-pass.
+        // Registrations themselves are kept; the backend owning each decides what to re-arm.
+        void clear_busy_after_clone() noexcept { for (auto& hook : slots_) hook.busy.store(false, std::memory_order_relaxed); }
+#endif
 
     private:
         // Advances exactly one hook per call. cursor_ is shared across every
