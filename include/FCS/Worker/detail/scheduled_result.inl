@@ -51,12 +51,14 @@ namespace FCS::Worker::detail {
         if (prev != 0 && prev != ready_flag) std::coroutine_handle<>::from_address(reinterpret_cast<void*>(prev)).resume();
     }
 
+#if FCS_HAS_EXCEPTIONS
     template<typename T>
     void scheduled_state<T>::set_exception(std::exception_ptr error) noexcept {
         error_ = std::move(error);
         const auto prev = continuation_.exchange(ready_flag, std::memory_order_acq_rel);
         if (prev != 0 && prev != ready_flag) std::coroutine_handle<>::from_address(reinterpret_cast<void*>(prev)).resume();
     }
+#endif
 
     template<typename T>
     bool scheduled_state<T>::is_ready() const noexcept {
@@ -71,7 +73,9 @@ namespace FCS::Worker::detail {
 
     template<typename T>
     T scheduled_state<T>::take_value() {
+#if FCS_HAS_EXCEPTIONS
         if (error_) std::rethrow_exception(error_);
+#endif
         return std::move(*value_);
     }
 

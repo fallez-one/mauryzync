@@ -10,7 +10,9 @@
 
 using namespace std::chrono_literals;
 using FCS::synchronization::interruptible_lock_guard;
+#if FCS_HAS_EXCEPTIONS
 using FCS::synchronization::interruptible_lock_guard_throwable;
+#endif
 using FCS::synchronization::interruptible_mutex;
 static int failures = 0;
 #define CHECK(c) do { if (!(c)) { ++failures; std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); } } while (0)
@@ -28,10 +30,15 @@ int main() {
         b.join();
         CHECK(got_in.load());                         // ...and it does get in once the holder leaves
     }
-    {   // 2. the throwable guard really holds the mutex
+    {   // 2. the guard really holds the mutex (the throwable one where exceptions exist, the plain one otherwise)
         interruptible_mutex m;
         {
+#if FCS_HAS_EXCEPTIONS
             interruptible_lock_guard_throwable<interruptible_mutex> g{m};
+#else
+            interruptible_lock_guard<interruptible_mutex> g{m};
+            CHECK(g.owns_lock());
+#endif
             CHECK(!m.try_lock());
         }
         CHECK(m.try_lock());
@@ -46,9 +53,11 @@ int main() {
             interruptible_lock_guard<interruptible_mutex> g{m};
             CHECK(!g.owns_lock());
         }
+#if FCS_HAS_EXCEPTIONS      // the throwing guard only exists where exceptions do
         bool threw = false;
         try { interruptible_lock_guard_throwable<interruptible_mutex> g{m}; } catch (const std::system_error&) { threw = true; }
         CHECK(threw);
+#endif
         CHECK(m.try_lock()); m.unlock();              // an interrupted guard released nothing it did not hold
         m.reset_interrupt();
         CHECK(!m.is_interrupted());

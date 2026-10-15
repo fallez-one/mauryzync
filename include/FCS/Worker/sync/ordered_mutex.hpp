@@ -22,32 +22,6 @@ namespace FCS::synchronization {
         // tickets with a CAS loop rather than a fetch_add. Pick this when the thread count is not under your control.
         block,
     };
-
-    // A FIFO (ticket) mutex whose queued acquirers can be cancelled all at once.
-    //
-    // EVERYTHING lives in one atomic word -- two counters, three flags and a generation -- so every state
-    // change is a single linearisable RMW, nothing needs a second variable to agree with it, and the word
-    // is exactly what futex / WaitOnAddress wait on (32 bits for uint8_t tickets, 64 for uint16_t):
-    //
-    //   [ ticket : N | serving : N | WAITERS | INTERRUPTED | LOCKED | generation ]      (high -> low)
-    //
-    //   ticket      next number to hand out (the TOP field: its carry falls off the end of the word,
-    //               so a plain fetch_add takes a ticket and wraps for free)
-    //   serving     whose turn it is
-    //   LOCKED      a thread has ENTERED the critical section. Not derivable from the counters: a waiter
-    //               whose turn has come but who has not yet woken is "served" without holding anything,
-    //               and interrupt() must be able to tell the two apart.
-    //   WAITERS     somebody may be asleep: the next state change must notify
-    //   INTERRUPTED sticky until reset_interrupt(); lock_interruptible() fails while it is set
-    //   generation  bumped by interrupt(); a waiter that finds a different generation than the one it
-    //               took its ticket in has been cancelled
-    //
-    // Cancellation is therefore just "reset the counters": interrupt() sets ticket = serving = 0 (or
-    // ticket = 1 when somebody is inside, who becomes ticket 0) and bumps the generation. No holes to
-    // skip, no per-ticket bookkeeping. Queued lock_interruptible() calls return false; queued plain
-    // lock() calls (which mask the interrupt) transparently take a fresh ticket -- so under an interrupt
-    // they re-queue at the back instead of keeping their place.
-    //
     // Lost wake-ups: waiters sleep on the whole word and every state change alters it, so a change
     // cannot be missed (a stale expected value just returns immediately), and the word cannot repeat
     // while a waiter is asleep (that would need serving to lap the waiter's own turn).

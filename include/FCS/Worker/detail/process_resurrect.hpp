@@ -45,18 +45,24 @@ namespace FCS::Worker::detail {
         }
 
         // Ends THIS process. For the parent of a clone, after it has handed over.
+#       ifdef _MSC_VER
+        // We're doing defense check if exit_impl unexpectedly did not close, so this is safe
+#       pragma warning(push)
+#       pragma warning(disable: 4702)
+#       endif
         [[noreturn]] void exit(int code = 0) const noexcept {
             const auto& self = static_cast<const Derived&>(*this);
             if constexpr (requires { self.exit_impl(code); }) self.exit_impl(code);
             else std::exit(code);
             std::abort(); // unreachable: keeps [[noreturn]] honest if an exit_impl ever returned
         }
+#       ifdef _MSC_VER
+#       pragma warning(pop)
+#       endif
 
-    protected:
-        // Public default construction (a Derived that is a plain `T x{}` must stay constructible,
-        // and with a protected constructor C++20 aggregate-init would try the base's); protected
-        // destruction is the CRTP guard against deleting through the base.
-        ~process_resurrect() = default;
+    // Deliberately NOT protected: a Derived written as `T x{}` is an aggregate (public base), and
+    // clang initialises its base through a temporary of the base type -- a protected destructor
+    // (or constructor) there is a hard error on clang/Android that GCC lets through.
     };
 
 #if defined(_WIN32)

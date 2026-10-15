@@ -213,8 +213,10 @@ constexpr auto plain_suspends = [](int base) -> FCS::async_result<int> {
     co_await std::suspend_always{}; ++v;
     co_return v;
 };
+#if FCS_HAS_EXCEPTIONS      // a callback that throws only exists where exceptions do
 constexpr auto throws_in_body = [](int) -> FCS::async_result<int> { throw std::runtime_error("boom"); co_return 0; };
 constexpr auto throws_before_coroutine = [](int) -> FCS::async_result<int> { throw std::runtime_error("early"); };
+#endif
 constexpr auto pull_with_checkpoint = []() -> FCS::pull_result<int> { co_await W::yield_point(); co_return 5; };
 
 void test_d_compat() {
@@ -222,13 +224,18 @@ void test_d_compat() {
     W::pool_service<> pool;
     pool.concurrency(2).start();
     auto a = pool.enqueue_and_poll(W::workload::Fast, plain_suspends, 4);
+#if FCS_HAS_EXCEPTIONS
     auto b = pool.enqueue_and_poll(W::workload::Fast, throws_in_body, 0);
     auto c = pool.enqueue_and_poll(W::workload::Fast, throws_before_coroutine, 0);
     CHECK(wait_for([&] { return a.ready() && b.ready() && c.ready(); }));
-    auto ra = a.user_data(); auto rb = b.user_data(); auto rc = c.user_data();
-    CHECK(ra.has_value() && *ra == 7);
+    auto rb = b.user_data(); auto rc = c.user_data();
     CHECK(!rb.has_value() && rb.error() == W::error::callback_threw);
     CHECK(!rc.has_value() && rc.error() == W::error::callback_threw);
+#else
+    CHECK(wait_for([&] { return a.ready(); }));
+#endif
+    auto ra = a.user_data();
+    CHECK(ra.has_value() && *ra == 7);
     pool.stop();
 
     auto pulled = pull_with_checkpoint().pull();   // not pool-driven: the checkpoint must not strand it

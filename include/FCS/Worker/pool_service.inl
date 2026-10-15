@@ -42,6 +42,28 @@ namespace FCS::Worker {
     }
 
     template<std::size_t QueueCapacity, typename Traits>
+    pool_service<QueueCapacity, Traits>& pool_service<QueueCapacity, Traits>::worker_affinity(std::span<const unsigned> cpus) {
+        if (!running_) { affinity_cpus_.assign(cpus.begin(), cpus.end()); affinity_spread_ = false; }
+        return *this;
+    }
+
+    template<std::size_t QueueCapacity, typename Traits>
+    pool_service<QueueCapacity, Traits>& pool_service<QueueCapacity, Traits>::worker_affinity_spread() noexcept {
+        if (!running_) { affinity_cpus_.clear(); affinity_spread_ = true; }
+        return *this;
+    }
+
+    // Runs on the worker's own thread, first thing. Nothing configured -> nothing touched.
+    template<std::size_t QueueCapacity, typename Traits>
+    void pool_service<QueueCapacity, Traits>::pin_worker(std::size_t id) noexcept {
+        unsigned cpu;
+        if (!affinity_cpus_.empty()) cpu = affinity_cpus_[id % affinity_cpus_.size()];
+        else if (affinity_spread_) cpu = static_cast<unsigned>(id % std::max(1u, std::thread::hardware_concurrency()));
+        else return;
+        if (!detail::pin_current_thread(cpu)) affinity_failures_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    template<std::size_t QueueCapacity, typename Traits>
     pool_service<QueueCapacity, Traits>& pool_service<QueueCapacity, Traits>::burst_backpressure(std::size_t full, std::size_t available, std::size_t candidates) noexcept {
         gate_.configure(full, available, candidates);
         return *this;
@@ -239,16 +261,12 @@ namespace FCS::Worker {
         const auto sequence = next_sequence_.fetch_add(1, std::memory_order_relaxed);
 
         const auto accepted = enqueue(lane, [this, lane, producer, callable = fn_t(std::forward<Callback>(cb)), values = args_t(std::forward<Args>(args)...)]() mutable {
-            // The one place in this library that still touches catch --
-            // boundary conversion only, turning a throwing callback (or a
-            // coroutine that completed via an unhandled exception -- see
-            // the auto-poll branch below) into a value instead of letting
-            // it vanish into execute()'s outer catch(...){} (which would
-            // otherwise leave this future stuck not-ready forever with no
-            // error signal at all). Nothing here ever throws on purpose,
-            // and nothing downstream of this ever catches: nowhere else in
-            // enqueue_and_poll or async_completed_result uses
-            // try/throw/catch.
+            // Boundary conversion only (FCS_TRY / FCS_CATCH_ALL: a real try/catch where exceptions
+            // exist, nothing at all under -fno-exceptions): a throwing callback, or a coroutine
+            // that ends in an unhandled exception, becomes error::callback_threw instead of
+            // vanishing into execute()'s outer catch (which would leave this future not-ready
+            // forever). A coroutine's exception arrives as a value (async_result::result()), not a
+            // throw, so complete() has nothing to catch. Nothing here throws on purpose.
             if constexpr (requires { typename async_result_value<invoke_t>::type; }) {
                 // cb(args...) returns FCS::async_result<T>: auto-poll it. The coroutine, its
                 // callable and its arguments move into a control block that owns them for the
@@ -260,9 +278,9 @@ namespace FCS::Worker {
                 // resume on a different worker than it last ran on.
                 using control_t = poll_control<invoke_t, payload_t, fn_t, args_t>;
                 auto* c = new control_t(this, lane, std::move(producer), std::move(callable), std::move(values));
-                try {
+                FCS_TRY {
                     c->coroutine.emplace(std::apply([&](auto&... v) { return std::invoke(c->callable, std::move(v)...); }, c->values));
-                } catch (...) {
+                } FCS_CATCH_ALL {
                     c->producer->set_value(payload_t{Unexpected{error::callback_threw}, {}});
                     control_t::release(c);
                     return;
@@ -276,10 +294,10 @@ namespace FCS::Worker {
                 promise.complete = &control_t::complete;
                 control_t::step(c); // consumes the initial reference
             } else {
-                try {
+                FCS_TRY {
                     auto value = std::apply([&](auto&... v) { return std::invoke(callable, std::move(v)...); }, values);
                     producer->set_value(payload_t{std::move(value), std::this_thread::get_id()});
-                } catch (...) {
+                } FCS_CATCH_ALL {
                     producer->set_value(payload_t{Unexpected{error::callback_threw}, {}});
                 }
             }
@@ -311,7 +329,7 @@ namespace FCS::Worker {
 
     template<std::size_t QueueCapacity, typename Traits>
     bool pool_service<QueueCapacity, Traits>::submit_requeue(queued_task_type&& work) noexcept {
-        try { return submit(std::move(work)); } catch (...) { return false; }
+        FCS_TRY { return submit(std::move(work)); } FCS_CATCH_ALL { return false; }
     }
 
     template<std::size_t QueueCapacity, typename Traits>
@@ -371,7 +389,7 @@ namespace FCS::Worker {
     template<std::size_t QueueCapacity, typename Traits>
     void pool_service<QueueCapacity, Traits>::execute(queued_task_type& work) {
         metrics_.adjust_active(1);
-        try { work.invoke(); } catch (...) {}
+        FCS_TRY { work.invoke(); } FCS_CATCH_ALL {}
         // Release whatever the task's closure captured (subscriber_guard,
         // RAII handles, anything) right away, rather than leaving it alive
         // inside `work` until this worker either picks up a new task
@@ -385,6 +403,7 @@ namespace FCS::Worker {
 
     template<std::size_t QueueCapacity, typename Traits>
     void pool_service<QueueCapacity, Traits>::worker_loop(std::size_t id) {
+        pin_worker(id);
         queued_task_type work{};
 
         // Let coroutines running on this thread see the watchdog's flag (cooperative yields).

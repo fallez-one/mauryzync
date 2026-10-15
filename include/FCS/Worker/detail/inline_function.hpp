@@ -89,9 +89,14 @@ namespace FCS::Worker::detail {
             void (*relocate)(unsigned char* dst, unsigned char* src) noexcept; // move-construct into dst, destroy src
             void (*destroy)(unsigned char*) noexcept;
         };
-
+#       ifdef _MSC_VER
+        // MSVC C4268 false positive: the vtable is explicitly constant-initialized
+        // with function pointers from non-capturing lambdas.
+#       pragma warning(push)
+#       pragma warning(disable: 4268)
+#       endif
         template<typename D>
-        static constexpr vtable table{
+        inline static constexpr vtable table{
             [](unsigned char* p, Args&&... a) -> R { return std::invoke(*std::launder(reinterpret_cast<D*>(p)), std::forward<Args>(a)...); },
             [](unsigned char* dst, unsigned char* src) noexcept {
                 auto* from = std::launder(reinterpret_cast<D*>(src));
@@ -100,6 +105,9 @@ namespace FCS::Worker::detail {
             },
             [](unsigned char* p) noexcept { std::destroy_at(std::launder(reinterpret_cast<D*>(p))); },
         };
+#       ifdef _MSC_VER
+#       pragma warning(pop)
+#       endif
 
         void take(inline_function&& other) noexcept {
             if (other.ops_ != nullptr) {

@@ -1,11 +1,6 @@
 #ifndef FCS_SIGNATURE_EXPECTED
 #define FCS_SIGNATURE_EXPECTED
 
-// FCS::Expected<T, E> / FCS::Unexpected<E> -- verbatim from FCS-Servant's
-// result.hpp (uploaded), just with this project's #pragma once convention
-// swapped in for the include-guard macro. Authoritative source; do not
-// hand-edit here without updating result.hpp upstream too.
-
 #include <variant>
 #include <utility>
 

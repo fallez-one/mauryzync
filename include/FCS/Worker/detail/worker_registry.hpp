@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../../exceptions.hpp"
 #include "../experimental.hpp"
 #include "hazard_domain.hpp"
 #include "idle_estimate.hpp"

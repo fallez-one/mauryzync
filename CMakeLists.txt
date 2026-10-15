@@ -5,22 +5,31 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Defaults ON only when FCS-Workers is the top-level project (not when pulled in
-# via add_subdirectory/FetchContent), so a consumer doesn't inherit its strict flags.
+# via add_subdirectory/FetchContent).
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(_fcs_top_level_default ON)
 else()
     set(_fcs_top_level_default OFF)
 endif()
 option(FCS_WORKER_IS_TOP_LEVEL "Whether FCS-Workers itself were actively developed" ${_fcs_top_level_default})
-option(FCS_APPLY_COMPILE_FLAGS "Whether to enable FCS-Workers preferred compile flags" ${FCS_WORKER_IS_TOP_LEVEL})
+option(FCS_WORKER_APPLY_COMPILE_FLAGS "Whether to enable FCS-Workers preferred compile flags" ${FCS_WORKER_IS_TOP_LEVEL})
+option(FCS_WORKER_WITH_TESTS "Whether to compile tests" ${FCS_WORKER_IS_TOP_LEVEL})
+option(FCS_WORKER_WITH_EXAMPLES "Whether to compile examples" ${FCS_WORKER_IS_TOP_LEVEL})
+
+# Experimental "always on" total-stall poll + runtime shed (pool_service::watchdog_total_stall_poll).
+# OFF: the calls exist and do nothing. See include/FCS/Worker/experimental.hpp.
+option(FCS_EXPERIMENTAL_ALWAYS_ON "Enable the experimental total-stall poll / runtime shed (fork-based resurrection)" OFF)
 
 if(FCS_WORKER_IS_TOP_LEVEL)
 	set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 endif()
 
-# Experimental "always on" total-stall poll + runtime shed (pool_service::watchdog_total_stall_poll).
-# OFF: the calls exist and do nothing. See include/FCS/Worker/experimental.hpp.
-option(FCS_EXPERIMENTAL_ALWAYS_ON "Enable the experimental total-stall poll / runtime shed (fork-based resurrection)" OFF)
+
+# Build FCS-Workers (and what links it, when the strict flags are applied) without C++ exceptions:
+# -fno-exceptions on GCC/Clang, /EHs-c- on MSVC (which already defines _HAS_EXCEPTIONS=0). The library
+# never throws: FCS::async_result::result() returns an Expected whose error carries a raise() function
+# pointer, so throwing is the caller's choice. See include/FCS/exceptions.hpp and Worker/coroutine.hpp.
+option(FCS_NO_EXCEPTIONS "Compile with exceptions disabled (-fno-exceptions / /EHs-c-)" ON)
 
 find_package(Threads REQUIRED)
 
@@ -32,7 +41,7 @@ if(FCS_EXPERIMENTAL_ALWAYS_ON)
 endif()
 
 if(WIN32)
-    target_compile_definitions(FCS-Workers INTERFACE FCS_WORKER_BACKEND_IOCP=1 NOMINMAX)
+    target_compile_definitions(FCS-Workers INTERFACE FCS_WORKER_BACKEND_IOCP=1 NOMINMAX WIN32_LEAN_AND_MEAN)
     target_link_libraries(FCS-Workers INTERFACE ws2_32)
 else()
     option(FCS_USE_IO_URING "Whether to prefer io_uring instead of epoll" OFF)
@@ -58,7 +67,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileFlags.cmake")
     include(cmake/CompileFlags.cmake)
 endif()
 
-if(FCS_APPLY_COMPILE_FLAGS AND COMMAND SERVER_OPTIMIZE)
+if(FCS_WORKER_APPLY_COMPILE_FLAGS AND COMMAND SERVER_OPTIMIZE)
     SERVER_OPTIMIZE(FCS-Workers INTERFACE)
 endif()
 
@@ -66,72 +75,103 @@ endif()
 # deploy host: `fcs_io_uring_probe human`.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(fcs_io_uring_probe cmake/probes/io_uring_probe.cpp)
-    if(FCS_APPLY_COMPILE_FLAGS AND COMMAND SERVER_OPTIMIZE)
+    if(FCS_WORKER_APPLY_COMPILE_FLAGS AND COMMAND SERVER_OPTIMIZE)
         SERVER_OPTIMIZE(fcs_io_uring_probe PRIVATE)
     endif()
 endif()
 
-add_executable(fcs_workers_example examples/example.cpp)
-target_link_libraries(fcs_workers_example PRIVATE FCS-Workers)
+if(FCS_WORKER_WITH_EXAMPLES)
+    add_executable(fcs_workers_example examples/example.cpp)
+    target_link_libraries(fcs_workers_example PRIVATE FCS-Workers)
+    add_executable(fcs_workers_windows_socket examples/windows_socket_integration.cpp)
+    target_link_libraries(fcs_workers_windows_socket PRIVATE FCS-Workers)
+    add_executable(fcs_workers_unix_socket examples/unix_socket_integration.cpp)
+    target_link_libraries(fcs_workers_unix_socket PRIVATE FCS-Workers)
+    add_executable(fcs_workers_backend_swap examples/backend_swap.cpp)
+    target_link_libraries(fcs_workers_windows_backend_swap PRIVATE FCS-Workers)
+endif()
 
+if(FCS_WORKER_WITH_TESTS)
+    # Lock-free park/unpark primitives that replaced the pool's mutex + condition_variable.
+    add_executable(fcs_workers_parking_lot_test tests/parking_lot_test.cpp)
+    target_link_libraries(fcs_workers_parking_lot_test PRIVATE FCS-Workers)
+
+    # Normal-priority admission reserve: a high-priority flood must not lock normal out at the door.
+    add_executable(fcs_workers_priority_admission_test tests/priority_admission_test.cpp)
+    target_link_libraries(fcs_workers_priority_admission_test PRIVATE FCS-Workers)
+
+    # Cooperative coroutines: watchdog-driven yield, reverse aging, thread-safe external awaits.
+    add_executable(fcs_workers_coop_yield_test tests/coop_yield_test.cpp)
+    target_link_libraries(fcs_workers_coop_yield_test PRIVATE FCS-Workers)
+
+    # Pool traits: custom semaphore type, unbounded admission gate, timer capacity, and their concepts.
+    add_executable(fcs_workers_pool_traits_test tests/pool_traits_test.cpp)
+    target_link_libraries(fcs_workers_pool_traits_test PRIVATE FCS-Workers)
+
+    # Interruptible mutex (sync/interruptible_mutex.hpp): exclusion survives interrupt(), guards really hold the lock.
+    add_executable(fcs_workers_interruptible_mutex_test tests/interruptible_mutex_test.cpp)
+    target_link_libraries(fcs_workers_interruptible_mutex_test PRIVATE FCS-Workers)
+
+    # FIFO ticket mutex with interruptible acquirers (sync/ordered_mutex.hpp).
+    add_executable(fcs_workers_ordered_mutex_test tests/ordered_mutex_test.cpp)
+    target_link_libraries(fcs_workers_ordered_mutex_test PRIVATE FCS-Workers)
+
+    # Bounded O(log N) timer min-heap (replaced an unbounded mutex-guarded one).
+    add_executable(fcs_workers_timer_heap_test tests/timer_heap_test.cpp)
+    target_link_libraries(fcs_workers_timer_heap_test PRIVATE FCS-Workers)
+
+    # Inline (non-allocating, move-only) callable that replaced std::function.
+    add_executable(fcs_workers_inline_function_test tests/inline_function_test.cpp)
+    target_link_libraries(fcs_workers_inline_function_test PRIVATE FCS-Workers)
+
+    # Stall watchdog: deterministic registry-level checks + an end-to-end rescue.
+    add_executable(fcs_workers_stall_rescue tests/stall_rescue.cpp)
+    target_link_libraries(fcs_workers_stall_rescue PRIVATE FCS-Workers)
+
+    # Unit test for the shared steal-estimate cache (header-only, no backend).
+    add_executable(fcs_workers_idle_estimate_test tests/idle_estimate_test.cpp)
+    target_link_libraries(fcs_workers_idle_estimate_test PRIVATE FCS-Workers)
+
+    # Backend contract test: identical assertions on epoll / io_uring / IOCP (see the file header).
+    add_executable(fcs_workers_backend_contract tests/backend_contract.cpp)
+    target_link_libraries(fcs_workers_backend_contract PRIVATE FCS-Workers)
+
+    # Regression test for epoll registration/handler lifetime under concurrent dispatch.
+    # Deterministic (ASan: heap-use-after-free on the pre-fix backend, 5/5 runs). POSIX-only: uses socketpair().
+    if(NOT WIN32)
+        add_executable(fcs_workers_dispatch_race tests/dispatch_race.cpp)
+        target_link_libraries(fcs_workers_dispatch_race PRIVATE FCS-Workers)
+
+        # Registration teardown runs user code (callback/Reader captures) that may cancel() other
+        # subscriptions of the same backend. Deadlocked the poller when registrations were freed under a mutex.
+        add_executable(fcs_workers_reclaim_reentry tests/reclaim_reentry.cpp)
+        target_link_libraries(fcs_workers_reclaim_reentry PRIVATE FCS-Workers)
+    endif()
+
+    # Total-stall poll + runtime shed. The ON build always exists (it forces the macro for itself);
+    # the OFF build -- the three calls are inert -- exists whenever the global option is off.
+    add_executable(fcs_workers_total_stall_shed_test tests/total_stall_shed_test.cpp)
+    target_link_libraries(fcs_workers_total_stall_shed_test PRIVATE FCS-Workers)
+    target_compile_definitions(fcs_workers_total_stall_shed_test PRIVATE FCS_EXPERIMENTAL_ALWAYS_ON=1)
+
+    if(NOT FCS_EXPERIMENTAL_ALWAYS_ON)
+        add_executable(fcs_workers_total_stall_shed_off_test tests/total_stall_shed_test.cpp)
+        target_link_libraries(fcs_workers_total_stall_shed_off_test PRIVATE FCS-Workers)
+    endif()
+    # Worker CPU affinity knob (off by default).
+    add_executable(fcs_workers_worker_affinity_test tests/worker_affinity_test.cpp)
+    target_link_libraries(fcs_workers_worker_affinity_test PRIVATE FCS-Workers)
+
+    # async_result / async_result<void>: result() is an Expected, throwing is the caller's choice.
+    add_executable(fcs_workers_async_result_test tests/async_result_expected_test.cpp)
+    target_link_libraries(fcs_workers_async_result_test PRIVATE FCS-Workers)
+endif()
+
+# Runtime stressor
 add_executable(fcs_workers_stressor stressors/pool_stressor.cpp)
 target_link_libraries(fcs_workers_stressor PRIVATE FCS-Workers)
 if(WIN32)
     target_link_libraries(fcs_workers_stressor PRIVATE winmm) # timeBeginPeriod
-endif()
-
-# Lock-free park/unpark primitives that replaced the pool's mutex + condition_variable.
-add_executable(fcs_workers_parking_lot_test tests/parking_lot_test.cpp)
-target_link_libraries(fcs_workers_parking_lot_test PRIVATE FCS-Workers)
-
-# Normal-priority admission reserve: a high-priority flood must not lock normal out at the door.
-add_executable(fcs_workers_priority_admission_test tests/priority_admission_test.cpp)
-target_link_libraries(fcs_workers_priority_admission_test PRIVATE FCS-Workers)
-
-# Cooperative coroutines: watchdog-driven yield, reverse aging, thread-safe external awaits.
-add_executable(fcs_workers_coop_yield_test tests/coop_yield_test.cpp)
-target_link_libraries(fcs_workers_coop_yield_test PRIVATE FCS-Workers)
-
-# Pool traits: custom semaphore type, unbounded admission gate, timer capacity, and their concepts.
-add_executable(fcs_workers_pool_traits_test tests/pool_traits_test.cpp)
-target_link_libraries(fcs_workers_pool_traits_test PRIVATE FCS-Workers)
-
-# Interruptible mutex (sync/interruptible_mutex.hpp): exclusion survives interrupt(), guards really hold the lock.
-add_executable(fcs_workers_interruptible_mutex_test tests/interruptible_mutex_test.cpp)
-target_link_libraries(fcs_workers_interruptible_mutex_test PRIVATE FCS-Workers)
-
-# Mutex stressor: exclusion / interrupt storm / fairness / cancel-all, with a hang detector.
-add_executable(fcs_workers_mutex_stress stressors/mutex_stress.cpp)
-target_link_libraries(fcs_workers_mutex_stress PRIVATE FCS-Workers)
-
-# FIFO ticket mutex with interruptible acquirers (sync/ordered_mutex.hpp).
-add_executable(fcs_workers_ordered_mutex_test tests/ordered_mutex_test.cpp)
-target_link_libraries(fcs_workers_ordered_mutex_test PRIVATE FCS-Workers)
-
-# Bounded O(log N) timer min-heap (replaced an unbounded mutex-guarded one).
-add_executable(fcs_workers_timer_heap_test tests/timer_heap_test.cpp)
-target_link_libraries(fcs_workers_timer_heap_test PRIVATE FCS-Workers)
-
-# Inline (non-allocating, move-only) callable that replaced std::function.
-add_executable(fcs_workers_inline_function_test tests/inline_function_test.cpp)
-target_link_libraries(fcs_workers_inline_function_test PRIVATE FCS-Workers)
-
-# Stall watchdog: deterministic registry-level checks + an end-to-end rescue.
-add_executable(fcs_workers_stall_rescue tests/stall_rescue.cpp)
-target_link_libraries(fcs_workers_stall_rescue PRIVATE FCS-Workers)
-
-# Unit test for the shared steal-estimate cache (header-only, no backend).
-add_executable(fcs_workers_idle_estimate_test tests/idle_estimate_test.cpp)
-target_link_libraries(fcs_workers_idle_estimate_test PRIVATE FCS-Workers)
-
-# Backend contract test: identical assertions on epoll / io_uring / IOCP (see the file header).
-add_executable(fcs_workers_backend_contract tests/backend_contract.cpp)
-target_link_libraries(fcs_workers_backend_contract PRIVATE FCS-Workers)
-
-# Raw Winsock/IOCP ceiling (no pool) -- Windows only; see the file header.
-if(WIN32)
-    add_executable(fcs_workers_iocp_ceiling stressors/iocp_ceiling.cpp)
-    target_link_libraries(fcs_workers_iocp_ceiling PRIVATE ws2_32 mswsock)
 endif()
 
 # Wakeup latency / submit throughput benchmark (A/B across library versions).
@@ -146,26 +186,19 @@ target_link_libraries(fcs_workers_steal_bench PRIVATE FCS-Workers)
 add_executable(fcs_workers_backend_bench stressors/backend_stress.cpp)
 target_link_libraries(fcs_workers_backend_bench PRIVATE FCS-Workers)
 
-# Regression test for epoll registration/handler lifetime under concurrent dispatch.
-# Deterministic (ASan: heap-use-after-free on the pre-fix backend, 5/5 runs). POSIX-only: uses socketpair().
-if(NOT WIN32)
-    add_executable(fcs_workers_dispatch_race tests/dispatch_race.cpp)
-    target_link_libraries(fcs_workers_dispatch_race PRIVATE FCS-Workers)
+# Raw Winsock/IOCP ceiling (no pool) -- Windows only; see the file header.
+if(WIN32)
+add_executable(fcs_workers_iocp_ceiling stressors/iocp_ceiling.cpp)
+    target_link_libraries(fcs_workers_iocp_ceiling PRIVATE ws2_32 mswsock)
 endif()
 
-# Total-stall poll + runtime shed. The ON build always exists (it forces the macro for itself);
-# the OFF build -- the three calls are inert -- exists whenever the global option is off.
-add_executable(fcs_workers_total_stall_shed_test tests/total_stall_shed_test.cpp)
-target_link_libraries(fcs_workers_total_stall_shed_test PRIVATE FCS-Workers)
-target_compile_definitions(fcs_workers_total_stall_shed_test PRIVATE FCS_EXPERIMENTAL_ALWAYS_ON=1)
-if(NOT FCS_EXPERIMENTAL_ALWAYS_ON)
-    add_executable(fcs_workers_total_stall_shed_off_test tests/total_stall_shed_test.cpp)
-    target_link_libraries(fcs_workers_total_stall_shed_off_test PRIVATE FCS-Workers)
-endif()
+# Mutex stressor: exclusion / interrupt storm / fairness / cancel-all, with a hang detector.
+add_executable(fcs_workers_mutex_stress stressors/mutex_stress.cpp)
+target_link_libraries(fcs_workers_mutex_stress PRIVATE FCS-Workers)
 
 # Stress test for the same: rollback storms, a multi-generation fork chain, and whole-process pauses.
 if(NOT WIN32)
-    add_executable(fcs_workers_shed_stress stressors/shed_stress.cpp)
-    target_link_libraries(fcs_workers_shed_stress PRIVATE FCS-Workers)
-    target_compile_definitions(fcs_workers_shed_stress PRIVATE FCS_EXPERIMENTAL_ALWAYS_ON=1)
+add_executable(fcs_workers_shed_stress stressors/shed_stress.cpp)
+target_link_libraries(fcs_workers_shed_stress PRIVATE FCS-Workers)
+target_compile_definitions(fcs_workers_shed_stress PRIVATE FCS_EXPERIMENTAL_ALWAYS_ON=1)
 endif()

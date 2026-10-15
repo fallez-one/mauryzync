@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -32,14 +33,25 @@
 #  include <sanitizer/lsan_interface.h>
 #endif
 
-#if FCS_EXPERIMENTAL_ALWAYS_ON && !defined(_WIN32)
-#  include <cerrno>
-#  include <csignal>
-#  include <poll.h>
-#  include <dirent.h>
-#  include <sys/wait.h>
-#  include <unistd.h>
-#  define FCS_TEST_REAL_FORK 1
+#if FCS_EXPERIMENTAL_ALWAYS_ON
+#  define FCS_TEST_REAL_FORK 1          // a real process clone: fork() here, RtlCloneUserProcess on NT
+#  if defined(_WIN32)
+#    ifndef WIN32_LEAN_AND_MEAN
+#      define WIN32_LEAN_AND_MEAN
+#    endif
+#    ifndef NOMINMAX
+#      define NOMINMAX
+#    endif
+#    include <windows.h>
+#    include <tlhelp32.h>
+#  else
+#    include <cerrno>
+#    include <csignal>
+#    include <poll.h>
+#    include <dirent.h>
+#    include <sys/wait.h>
+#    include <unistd.h>
+#  endif
 #else
 #  define FCS_TEST_REAL_FORK 0
 #endif
@@ -446,7 +458,8 @@ void part2_rollback() {
     CHECK(after.injected_cushion + after.injected_mpmc == static_cast<std::size_t>(kTasks));
     CHECK(after.refused == 0);
     const auto st = pool.resurrection_stats();
-    CHECK(st.polls_opened == 1 && st.polls_cleared == 0);
+    // An early poll (the gate task alone can be "total stall" for a moment) may clear first: assert the books, not the count.
+    CHECK(st.polls_opened >= 1 && st.polls_opened == st.polls_cleared + st.sheds_started);
     CHECK(st.sheds_started == 1 && st.sheds_aborted == 1 && st.resurrections == 0 && st.generation == 0);
     CHECK(st.tasks_evacuated == static_cast<std::uint64_t>(kTasks) && st.tasks_reinjected == static_cast<std::uint64_t>(kTasks));
     CHECK(st.tasks_refused == 0 && st.tasks_unreachable == 0);
@@ -470,12 +483,37 @@ struct wire {
 };
 enum : std::uint32_t { k_hook = 1, k_task = 2, k_evacuated = 3, k_injected = 4, k_injected2 = 5, k_done = 6, k_parent_exit = 7 };
 
+#if defined(_WIN32)
+// NT: no fork, so the throw-away scenario process is this same executable re-launched with
+// --scenario <handle>. The pipe's write end is inheritable, and RtlCloneUserProcess is asked to
+// inherit handles, so the clone writes to it too. (A clone has no console and no csrss link: the
+// pipe is the only voice it has.)
+HANDLE g_pipe = nullptr;
+void send(std::uint32_t kind, std::uint64_t a = 0, std::uint64_t b = 0) {
+    const wire w{kind, a, b};
+    DWORD written = 0;
+    (void)::WriteFile(g_pipe, &w, sizeof w, &written, nullptr);   // <= PIPE_BUF-ish: one record per call
+}
+std::uint64_t current_pid() { return ::GetCurrentProcessId(); }
+// 0 when the snapshot API is not usable in this process (it may not be, in a clone).
+std::size_t thread_count_of_this_process() {
+    const HANDLE snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    THREADENTRY32 e{}; e.dwSize = sizeof e;
+    std::size_t n = 0;
+    if (::Thread32First(snap, &e)) do { if (e.th32OwnerProcessID == ::GetCurrentProcessId()) ++n; } while (::Thread32Next(snap, &e));
+    ::CloseHandle(snap);
+    return n;
+}
+[[noreturn]] void hard_exit(int code) { ::TerminateProcess(::GetCurrentProcess(), static_cast<UINT>(code)); for (;;) {} }
+#else
 int g_fd = -1;
 void send(std::uint32_t kind, std::uint64_t a = 0, std::uint64_t b = 0) {
     const wire w{kind, a, b};
     const auto n = ::write(g_fd, &w, sizeof w);   // <= PIPE_BUF: atomic
     (void)n;
 }
+std::uint64_t current_pid() { return static_cast<std::uint64_t>(::getpid()); }
 std::size_t thread_count_of_this_process() {
     std::size_t n = 0;
     if (DIR* d = ::opendir("/proc/self/task")) {
@@ -484,9 +522,11 @@ std::size_t thread_count_of_this_process() {
     }
     return n;
 }
+[[noreturn]] void hard_exit(int code) { ::_exit(code); }
+#endif
 
 using fork_pool = W::pool_service<>;
-FCS::Worker::synchronization::interruptible_mutex g_mutex;   // held by a worker that wedges: nobody will ever unlock it
+FCS::synchronization::interruptible_mutex g_mutex;   // held by a worker that wedges: nobody will ever unlock it
 
 // Runs in the throw-away process S. Never returns: S ends in the pool's parent path (resurrector.exit)
 // -- or, if the shed never comes, in the timeout at the bottom.
@@ -503,7 +543,7 @@ FCS::Worker::synchronization::interruptible_mutex g_mutex;   // held by a worker
             const auto st = pool.resurrection_stats();
             send(k_injected2, st.generation, st.resurrections);
             send(k_done, st.tasks_reinjected, st.tasks_evacuated);
-            ::_exit(0);
+            hard_exit(0);
         }
     };
 
@@ -512,23 +552,109 @@ FCS::Worker::synchronization::interruptible_mutex g_mutex;   // held by a worker
         .watchdog_total_stall_poll(100ms, 1)
         .watchdog_finalize_wait(50ms)
         .watchdog_on_migrate([](fork_pool::migration_context& ctx) {
-            send(k_hook, static_cast<std::uint64_t>(::getpid()), thread_count_of_this_process());
+            send(k_hook, current_pid(), thread_count_of_this_process());
             if (g_mutex.locking()) g_mutex.unlock();           // repair what the vanished worker held
             send(k_evacuated, ctx.report.evacuated_local, ctx.report.evacuated_cushion);
             const auto st = pool.resurrection_stats();
             send(k_injected, st.sheds_started, st.polls_opened);   // inherited from the parent: 1 shed, >=1 poll
         });
-        // after the clone the stats also say which generation this is, reported by the finisher below
     pool.start();
     sc.build(pool);
 
-    // The clone reports its own telemetry once every task has run (it has no main thread: a pool
-    // worker's task does it). Registered as one more task, submitted by the hook-free path below.
     // Nothing else may happen in this process after the clone but the parent's exit().
     std::this_thread::sleep_for(10s);
-    ::_exit(3);                                                // the shed never came
+    hard_exit(3);                                              // the shed never came
 }
 
+// Checks shared by both platforms, over the records the clone sent.
+void check_records(const std::vector<wire>& got, std::uint64_t scenario_pid, bool timed_out, bool exited_cleanly) {
+    std::uint64_t clone_pid = 0;
+    for (const auto& w : got) if (w.kind == k_hook) clone_pid = w.a;
+    CHECK(!timed_out);
+    CHECK(exited_cleanly);                                    // the parent left through resurrector.exit(0), not the 10 s timeout (3)
+
+    std::array<int, kTasks + 1> ran{};
+    int hooks = 0; std::uint64_t threads_in_hook = 0, evac_local = 0, evac_cushion = 0;
+    for (const auto& w : got) {
+        if (w.kind == k_task && w.a >= 1 && w.a <= kTasks) ++ran[static_cast<std::size_t>(w.a)];
+        if (w.kind == k_hook) { ++hooks; threads_in_hook = w.b; }
+        if (w.kind == k_evacuated) { evac_local = w.a; evac_cushion = w.b; }
+    }
+    int smalls_once = 0;
+    for (int i = 1; i <= kSmalls; ++i) smalls_once += ran[static_cast<std::size_t>(i)] == 1 ? 1 : 0;
+    std::printf("   hook ran %d time(s) in pid %llu with %llu thread(s); evacuated local=%llu cushion=%llu; %d/%d deque tasks ran exactly once\n",
+                hooks, static_cast<unsigned long long>(clone_pid), static_cast<unsigned long long>(threads_in_hook),
+                static_cast<unsigned long long>(evac_local), static_cast<unsigned long long>(evac_cushion), smalls_once, kSmalls);
+    CHECK(hooks == 1);
+    CHECK(clone_pid != scenario_pid && clone_pid > 0);        // it really ran in a different process
+    CHECK(threads_in_hook == 1 || threads_in_hook == 0);      // only the watchdog's thread existed there (0: the platform could not count)
+    CHECK(evac_local == static_cast<std::uint64_t>(kSmalls));
+    CHECK(evac_cushion == static_cast<std::uint64_t>(kExtras));
+    CHECK(smalls_once == kSmalls);                            // includes task 5, which needed the mutex the hook repaired
+    int extras_once = 0;
+    for (int i = kSmalls + 1; i <= kTasks; ++i) extras_once += ran[static_cast<std::size_t>(i)] == 1 ? 1 : 0;
+    CHECK(extras_once == kExtras);                            // the cushion ones too, both lanes, both priorities
+    bool done = false;
+    for (const auto& w : got) {
+        if (w.kind == k_injected) { CHECK(w.a == 1); CHECK(w.b >= 1); }
+        if (w.kind == k_injected2) { CHECK(w.a == 1 && w.b == 1); }          // generation 1, one resurrection
+        if (w.kind == k_done) { done = true; CHECK(w.a == static_cast<std::uint64_t>(kTasks)); CHECK(w.b == static_cast<std::uint64_t>(kTasks)); }   // telemetry survived the clone
+    }
+    CHECK(done);
+}
+
+#if defined(_WIN32)
+void part3_real_fork(const char* self_path) {
+    std::printf("part 3 (NT): RtlCloneUserProcess -- 3 workers wedged (one holding a mutex), tasks in a deque and the cushion\n");
+    std::fflush(stdout);
+    SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};            // inheritable
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!::CreatePipe(&rd, &wr, &sa, 1 << 16)) { ++failures; std::printf("  FAIL CreatePipe\n"); return; }
+    ::SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);          // only the write end crosses
+
+    std::string cmd = std::string{"\""} + self_path + "\" --scenario " + std::to_string(reinterpret_cast<std::uintptr_t>(wr));
+    STARTUPINFOA si{}; si.cb = sizeof si;
+    PROCESS_INFORMATION pi{};
+    if (!::CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
+        ++failures; std::printf("  FAIL CreateProcess (%lu)\n", ::GetLastError());
+        ::CloseHandle(rd); ::CloseHandle(wr); return;
+    }
+    ::CloseHandle(wr);                                           // so EOF means "scenario AND clone are gone"
+
+    std::vector<wire> got;
+    std::vector<unsigned char> buf;
+    std::uint64_t clone_pid = 0;
+    bool timed_out = false;
+    const auto end = std::chrono::steady_clock::now() + 20s;
+    for (;;) {
+        if (std::chrono::steady_clock::now() >= end) { timed_out = true; break; }
+        DWORD avail = 0;
+        if (!::PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr)) break;   // broken pipe: every writer closed
+        if (avail == 0) { std::this_thread::sleep_for(2ms); continue; }
+        unsigned char tmp[4096];
+        DWORD n = 0;
+        if (!::ReadFile(rd, tmp, static_cast<DWORD>(std::min<std::size_t>(sizeof tmp, avail)), &n, nullptr) || n == 0) break;
+        buf.insert(buf.end(), tmp, tmp + n);
+        while (buf.size() >= sizeof(wire)) {
+            wire w; std::memcpy(&w, buf.data(), sizeof w);
+            buf.erase(buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(sizeof w));
+            got.push_back(w);
+            if (w.kind == k_hook) clone_pid = w.a;
+        }
+    }
+    ::CloseHandle(rd);
+    if (timed_out) {
+        std::printf("  (timed out waiting for the clone)\n");
+        if (clone_pid) if (const HANDLE h = ::OpenProcess(PROCESS_TERMINATE, FALSE, static_cast<DWORD>(clone_pid))) { ::TerminateProcess(h, 1); ::CloseHandle(h); }
+        ::TerminateProcess(pi.hProcess, 1);
+    }
+    ::WaitForSingleObject(pi.hProcess, 5000);
+    DWORD code = 99;
+    ::GetExitCodeProcess(pi.hProcess, &code);
+    ::CloseHandle(pi.hThread); ::CloseHandle(pi.hProcess);
+    check_records(got, pi.dwProcessId, timed_out, code == 0);
+}
+#else
 void part3_real_fork() {
     std::printf("part 3: real fork -- 3 workers wedged (one holding a mutex), tasks in a deque and the cushion\n");
     int fds[2];
@@ -571,46 +697,23 @@ void part3_real_fork() {
     }
     int status = 0;
     (void)::waitpid(scenario, &status, 0);
-
-    CHECK(!timed_out);
-    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);     // the parent left through resurrector.exit(0), not the 10 s timeout (3)
-
-    std::array<int, kTasks + 1> ran{};
-    int hooks = 0; std::uint64_t threads_in_hook = 0, evac_local = 0, evac_cushion = 0;
-    for (const auto& w : got) {
-        if (w.kind == k_task && w.a >= 1 && w.a <= kTasks) ++ran[static_cast<std::size_t>(w.a)];
-        if (w.kind == k_hook) { ++hooks; threads_in_hook = w.b; }
-        if (w.kind == k_evacuated) { evac_local = w.a; evac_cushion = w.b; }
-    }
-    int smalls_once = 0;
-    for (int i = 1; i <= kSmalls; ++i) smalls_once += ran[static_cast<std::size_t>(i)] == 1 ? 1 : 0;
-    std::printf("   hook ran %d time(s) in pid %d with %llu thread(s); evacuated local=%llu cushion=%llu; %d/%d deque tasks ran exactly once\n",
-                hooks, static_cast<int>(clone_pid), static_cast<unsigned long long>(threads_in_hook),
-                static_cast<unsigned long long>(evac_local), static_cast<unsigned long long>(evac_cushion), smalls_once, kSmalls);
-    CHECK(hooks == 1);
-    CHECK(clone_pid != scenario && clone_pid > 0);            // it really ran in a different process
-    CHECK(threads_in_hook == 1);                              // and only the watchdog's thread existed there
-    CHECK(evac_local == static_cast<std::uint64_t>(kSmalls));
-    CHECK(evac_cushion == static_cast<std::uint64_t>(kExtras));
-    CHECK(smalls_once == kSmalls);                            // includes task 5, which needed the mutex the hook repaired
-    int extras_once = 0;
-    for (int i = kSmalls + 1; i <= kTasks; ++i) extras_once += ran[static_cast<std::size_t>(i)] == 1 ? 1 : 0;
-    CHECK(extras_once == kExtras);                            // the cushion ones too, both lanes, both priorities
-    for (const auto& w : got) if (w.kind == k_injected) { CHECK(w.a == 1); CHECK(w.b >= 1); }
-    bool done = false;
-    for (const auto& w : got) {
-        if (w.kind == k_injected2) { CHECK(w.a == 1 && w.b == 1); }          // generation 1, one resurrection
-        if (w.kind == k_done) { done = true; CHECK(w.a == static_cast<std::uint64_t>(kTasks)); CHECK(w.b == static_cast<std::uint64_t>(kTasks)); }   // telemetry survived the clone
-    }
-    CHECK(done);
+    check_records(got, static_cast<std::uint64_t>(scenario), timed_out, WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
+#endif
 #endif // FCS_TEST_REAL_FORK
 
 #endif // FCS_EXPERIMENTAL_ALWAYS_ON
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+#if FCS_EXPERIMENTAL_ALWAYS_ON && defined(_WIN32)
+    if (argc == 3 && std::strcmp(argv[1], "--scenario") == 0) {       // the throw-away process of part 3
+        g_pipe = reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(std::strtoull(argv[2], nullptr, 10)));
+        fork_scenario();
+    }
+#endif
+    (void)argc; (void)argv;
 #if !FCS_EXPERIMENTAL_ALWAYS_ON
     off_is_noop();
 #else
@@ -620,10 +723,10 @@ int main() {
     part2_false_alarm();
     part2_quorum();
     part2_rollback();
-#  if FCS_TEST_REAL_FORK
-    part3_real_fork();
+#  if defined(_WIN32)
+    part3_real_fork(argv[0]);
 #  else
-    std::printf("part 3: skipped (no fork on this platform / see the NT notes in process_resurrect.hpp)\n");
+    part3_real_fork();
 #  endif
 #endif
     std::printf(failures ? "total_stall_shed: %d FAILED\n" : "total_stall_shed: all passed\n", failures);

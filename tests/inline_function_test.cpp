@@ -1,5 +1,6 @@
 // inline_function: move-only, never allocates, relocates correctly, destroys exactly once.
 #include <FCS/Worker/detail/inline_function.hpp>
+#include <FCS/exceptions.hpp>
 
 #include <cstdio>
 #include <cstdlib>
@@ -13,7 +14,15 @@ static int failures = 0;
 
 // count every heap allocation: the whole point is that there are none
 static long g_allocs = 0;
-void* operator new(std::size_t n) { ++g_allocs; if (void* p = std::malloc(n)) return p; throw std::bad_alloc(); }
+void* operator new(std::size_t n) {
+    ++g_allocs;
+    if (void* p = std::malloc(n)) return p;
+#if FCS_HAS_EXCEPTIONS
+    throw std::bad_alloc();
+#else
+    std::abort();
+#endif
+}
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 

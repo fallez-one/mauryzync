@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../exceptions.hpp"
 #include "experimental.hpp"
 #include "async_completed_result.hpp"
 #include "detail/admission_gate.hpp"
@@ -11,6 +12,7 @@
 #include "detail/priority_mpmc_queue.hpp"
 #include "detail/scheduled_result.hpp"
 #include "detail/resurrection_metrics.hpp"
+#include "detail/thread_affinity.hpp"
 #include "detail/shed_migration.hpp"
 #include "detail/scheduler_metrics.hpp"
 #include "detail/task.hpp"
@@ -26,11 +28,12 @@
 #endif
 
 #include <atomic>
+#include <initializer_list>
+#include <span>
 #include <cstdio>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <thread>
@@ -90,6 +93,21 @@ namespace FCS::Worker {
         ~pool_service();
 
         pool_service& concurrency(std::size_t count) noexcept;
+
+        // CPU affinity -- OFF unless asked for: by default no worker's affinity is touched and the
+        // OS scheduler places them freely.
+        //   worker_affinity({2, 3})   worker i pins itself to cpus[i % cpus.size()], as it starts
+        //   worker_affinity_spread()  worker i pins itself to CPU i % std::thread::hardware_concurrency()
+        //   worker_affinity({})       back to "no affinity"
+        // Set before start(); ignored once running. Best effort: a CPU the OS refuses (out of range,
+        // outside the cpuset/cgroup -- common on Android) leaves that worker unpinned and counts in
+        // worker_affinity_failures(). Linux (incl. Android: sched_setaffinity, since bionic has no
+        // pthread_setaffinity_np) and Windows (first 64 CPUs); a no-op elsewhere. A resurrected clone's
+        // new workers are pinned the same way.
+        pool_service& worker_affinity(std::span<const unsigned> cpus);
+        pool_service& worker_affinity(std::initializer_list<unsigned> cpus) { return worker_affinity(std::span<const unsigned>{cpus.begin(), cpus.size()}); }
+        pool_service& worker_affinity_spread() noexcept;
+        [[nodiscard]] std::size_t worker_affinity_failures() const noexcept { return affinity_failures_.load(std::memory_order_relaxed); }
         // Stall watchdog -- a small, non-intrusive monitor (one extra thread,
         // no central scheduler) for workers held up by a long-running task. A
         // worker stuck in a task cannot work through its own local deque, yet
@@ -408,6 +426,10 @@ namespace FCS::Worker {
         std::atomic<std::int64_t> poll_tolerance_ns_{1'000'000}; // 1ms default; see timeout_tolerate()
         std::atomic<std::uint64_t> next_sequence_{}; // enqueue_and_poll()'s async_completed_result::sequence() source
         std::size_t threads_{1};
+        std::vector<unsigned> affinity_cpus_;          // empty + !spread == no affinity (the default)
+        bool affinity_spread_{false};
+        std::atomic<std::size_t> affinity_failures_{0};
+        void pin_worker(std::size_t id) noexcept;
         // Parked workers: lock-free (semaphore per worker), wakes targeted. See parking_lot.hpp.
         detail::parking_lot<max_workers, semaphore_type> parking_;
         std::atomic<std::uint32_t> coop_yield_depth_{3};
@@ -449,13 +471,13 @@ namespace FCS::Worker {
                     // the continuation can go straight into it, a few tasks back. No queue, no
                     // admission, no waking anyone.
                     if (view.owner == c->pool) {
-                        try {
+                        FCS_TRY {
                             if (c->pool->registry_.requeue_behind(view.id, make(), c->pool->coop_yield_depth_.load(std::memory_order_relaxed), c->pool->metrics_)) {
                                 view.yielded = true;
                                 if (view.profile) view.profile->record_coop_yield();
                                 return true;
                             }
-                        } catch (...) {}
+                        } FCS_CATCH_ALL {}
                         if (view.profile) view.profile->record_coop_global_requeue();
                     }
                     if (c->pool->submit_requeue(make())) {
@@ -476,10 +498,11 @@ namespace FCS::Worker {
             // Runs at the coroutine's final suspend point, on whichever thread finished it.
             static void complete(void* p) noexcept {
                 auto* c = static_cast<poll_control*>(p);
-                std::optional<Payload> payload;
-                try { payload.emplace(Payload{c->coroutine->result(), std::this_thread::get_id()}); }
-                catch (...) { payload.emplace(Payload{Unexpected{error::callback_threw}, {}}); }
-                c->producer->set_value(std::move(*payload));
+                // result() hands back a value or a failure; nothing here can throw, so nothing here catches.
+                // (not_ready cannot happen -- this runs at the final suspend point -- but is mapped through anyway.)
+                auto outcome = c->coroutine->result();
+                if (outcome.has_value()) c->producer->set_value(Payload{std::move(outcome.value()), std::this_thread::get_id()});
+                else c->producer->set_value(Payload{Unexpected{outcome.error().code}, {}});
             }
 
             // One pool task: resume the coroutine until it hands itself off, finishes, or yields.

@@ -97,7 +97,9 @@ namespace FCS::Worker {
             // wedge -- credit it back and look again. (A thread merely a little late is just jitter.)
             const auto woke = std::chrono::steady_clock::now();
             const auto late = (woke - now) - asked;
-            if (late > std::max<std::chrono::nanoseconds>(4 * slice, std::chrono::milliseconds{4})) {
+            // The threshold is pause-sized on purpose: Windows' default timer granularity (~15 ms) makes a
+            // 1 ms park routinely overshoot by that much, and that is jitter, not a stopped process.
+            if (late > std::max<std::chrono::nanoseconds>(8 * slice, std::chrono::milliseconds{50})) {
                 deadline += late;
                 resurrection_.polls_extended.fetch_add(1, std::memory_order_relaxed);
             }
@@ -301,7 +303,7 @@ namespace FCS::Worker {
 
         if (migrate_hook_) {
             migration_context context{*shed_batch_, shed_report_};
-            try { migrate_hook_(context); } catch (...) {}   // boundary: a throwing hook must not cost the clone its tasks
+            FCS_TRY { migrate_hook_(context); } FCS_CATCH_ALL {}   // boundary: a throwing hook must not cost the clone its tasks
         }
 
         reinject_all(/*direct_local=*/true);

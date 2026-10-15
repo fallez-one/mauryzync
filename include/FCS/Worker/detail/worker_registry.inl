@@ -42,9 +42,9 @@ namespace FCS::Worker::detail {
         // report "not requeued". (A failure later, re-pushing the tasks into the slot this one
         // took, is a bad_alloc on a few-hundred-byte segment -- the same exposure drain_global
         // has, and treated the same way: not survivable.)
-        try {
+        FCS_TRY {
             push(std::move(task));
-        } catch (...) {
+        } FCS_CATCH_ALL {
             for (std::size_t i = lifted; i-- > 0;) push(std::move(held[i]));
             return false;
         }

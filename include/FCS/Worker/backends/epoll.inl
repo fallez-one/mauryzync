@@ -2,11 +2,14 @@
 
 #include <cerrno>
 #include <chrono>
+#include <new>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
 
 namespace FCS::Worker::backend::epoll {
+
+    // ---------------------------------------------------------------- lifecycle
 
     template<typename Pool>
     inline backend<Pool>::backend(Pool& service) : generic_eventlooper<backend<Pool>, int, Pool>(service) {
@@ -22,8 +25,7 @@ namespace FCS::Worker::backend::epoll {
     template<typename Pool>
     inline backend<Pool>::~backend() {
         stop_backend();
-        for (auto& slot : slots_) delete slot.load(std::memory_order_relaxed);
-        for (auto* retired : retired_handlers_) delete retired;
+        discard();
         if (epoll_fd_ >= 0) ::close(epoll_fd_);
         if (wakeup_fd_ >= 0) ::close(wakeup_fd_);
     }
@@ -46,89 +48,43 @@ namespace FCS::Worker::backend::epoll {
     inline void backend<Pool>::stop_backend() noexcept {
         if (polling_.exchange(false)) {
             if (poller_.joinable()) {
-                if (wakeup_fd_ >= 0) { std::uint64_t one{1}; (void)!::write(wakeup_fd_, &one, sizeof(one)); }
+                wake();
                 poller_.join();
             } else {
+                // Waits out any poll_once() already in flight on another worker.
                 this->service().unregister_poll_hook(poll_hook_);
             }
-            reclaim();
+            // From here this thread is the only driver: flush what was registered
+            // or cancelled while the last one was shutting down, and free the dead.
+            (void)service_commands();
         }
         generic_eventlooper<backend<Pool>, int, Pool>::stop_backend();
     }
 
 
+    // Everything still registered, plus their commands. Only called once nothing
+    // is driving. Every registration is marked dead *first*, so a destructor of
+    // user code that cancel()s another one of them can't queue a command nobody
+    // will ever service.
     template<typename Pool>
-    inline typename backend<Pool>::registration* backend<Pool>::find_or_create_slot_locked(int fd, source_kind kind, std::size_t& index_out, bool& is_new) {
-        for (std::size_t i = 0; i < capacity; ++i) {
-            auto* ptr = slots_[i].load(std::memory_order_acquire);
-            if (ptr && ptr->fd == fd && ptr->active.load(std::memory_order_acquire)) {
-                index_out = i;
-                is_new = false;
-                return ptr;
+    inline void backend<Pool>::discard() noexcept {
+        for (auto& slot : slots_) {
+            if (auto* registration_ptr = slot.load(std::memory_order_acquire)) (void)slots_state_.request_cancel(registration_ptr->h);
+        }
+        for (auto& slot : slots_) {
+            if (auto* registration_ptr = slot.load(std::memory_order_acquire)) {
+                slot.store(nullptr, std::memory_order_release);
+                delete registration_ptr;
             }
         }
-
-        auto* registration_ptr = new registration{};
-        registration_ptr->fd = fd;
-        registration_ptr->kind = kind;
-        for (std::size_t i = 0; i < capacity; ++i) {
-            registration* expected = nullptr;
-            if (slots_[i].compare_exchange_strong(expected, registration_ptr, std::memory_order_release, std::memory_order_relaxed)) {
-                registration_ptr->index = i;
-                registration_ptr->generation = generations_[i].fetch_add(1, std::memory_order_relaxed) + 1;
-                index_out = i;
-                is_new = true;
-                return registration_ptr;
-            }
-        }
-        delete registration_ptr;
-        return nullptr;
-    }
-
-
-    template<typename Pool>
-    inline bool backend<Pool>::update_interest(registration& reg, bool is_new) noexcept {
-        ::epoll_event ev{};
-        ev.events = (reg.read_active.load(std::memory_order_relaxed) ? static_cast<std::uint32_t>(EPOLLIN) : 0u)
-                  | (reg.write_active.load(std::memory_order_relaxed) ? static_cast<std::uint32_t>(EPOLLOUT) : 0u);
-        ev.data.u32 = static_cast<std::uint32_t>(reg.index);
-        return ::epoll_ctl(epoll_fd_, is_new ? EPOLL_CTL_ADD : EPOLL_CTL_MOD, reg.fd, &ev) == 0;
-    }
-
-
-    template<typename Pool>
-    inline void backend<Pool>::publish_handler(std::atomic<handler*>& slot, ::FCS::Worker::detail::callback_function<void()> fn) {
-        auto* fresh = new handler{std::move(fn)};
-        if (auto* old = slot.exchange(fresh, std::memory_order_acq_rel)) {
-            retired_handlers_.push_back(old);
-            retired_handler_count_.store(retired_handlers_.size(), std::memory_order_relaxed);
+        for (command* cmd = cmds_.take_all(); cmd != nullptr;) {
+            command* next = cmd->next;
+            delete cmd;
+            cmd = next;
         }
     }
 
-
-    template<typename Pool>
-    inline void backend<Pool>::retire_direction(registration& reg, bool read) noexcept {
-        std::lock_guard lock{slots_mutex_};
-        (read ? reg.read_active : reg.write_active).store(false, std::memory_order_release);
-        detach_direction(reg);
-    }
-
-
-    template<typename Pool>
-    inline void backend<Pool>::detach_direction(registration& reg) noexcept {
-        if (!reg.read_active.load(std::memory_order_acquire) && !reg.write_active.load(std::memory_order_acquire)) {
-            reg.active.store(false, std::memory_order_release);
-            scan_needed_.store(true, std::memory_order_release);
-            ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, reg.fd, nullptr);
-        } else {
-            ::epoll_event ev{};
-            ev.events = (reg.read_active.load(std::memory_order_relaxed) ? static_cast<std::uint32_t>(EPOLLIN) : 0u)
-                      | (reg.write_active.load(std::memory_order_relaxed) ? static_cast<std::uint32_t>(EPOLLOUT) : 0u);
-            ev.data.u32 = static_cast<std::uint32_t>(reg.index);
-            ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, reg.fd, &ev);
-        }
-    }
-
+    // ------------------------------------------------------------- any thread
 
     template<typename Pool>
     template<typename Tag, std::size_t Size, detail::recv_option Options, typename Reader, typename Source, typename Callback>
@@ -139,61 +95,54 @@ namespace FCS::Worker::backend::epoll {
         const auto fd = detail::resolve_native(source);
         const auto kind = detail::resolve_kind(source);
 
-        std::size_t index{};
-        bool is_new{};
-        // Held from find through the direction flag being set -- see the
-        // threading-model comment in epoll.hpp.
-        std::lock_guard setup_lock{slots_mutex_};
-        auto* registration_ptr = find_or_create_slot_locked(fd, kind, index, is_new);
-        if (!registration_ptr) return {};
+        const auto claimed = slots_state_.claim();
+        if (!claimed) return {};
 
-        registration_ptr->read_channel_subscription = this->service().template subscribe<Tag>(std::forward<Callback>(callback));
-        publish_handler(registration_ptr->on_readable, [this, registration_ptr, reader_fn = std::forward<Reader>(reader)]() mutable {
+        auto* registration_ptr = new registration{};
+        registration_ptr->h = *claimed;
+        registration_ptr->fd = fd;
+        registration_ptr->kind = kind;
+        registration_ptr->dir = direction::read;
+        registration_ptr->channel_subscription = this->service().template subscribe<Tag>(std::forward<Callback>(callback));
+        registration_ptr->on_event = [this, reader_fn = std::forward<Reader>(reader)](registration& reg, int arm_error) mutable -> action {
             const auto submitted_at = std::chrono::steady_clock::now();
-            detail::readiness_source<Options> src{registration_ptr->fd, registration_ptr->kind};
-            auto result = std::invoke(reader_fn, src);
-
             completion<Size> c{};
-            c.user_data = registration_ptr->index;
-            c.generation = registration_ptr->generation;
-            c.kind = registration_ptr->kind;
+            c.user_data = reg.h.index;
+            c.generation = reg.h.generation;
+            c.kind = reg.kind;
             c.op = completion_op::read;
             c.submitted_at = submitted_at;
-            c.completed_at = std::chrono::steady_clock::now();
-            c.result = result;
 
-            bool retire = false;
-            if (src.failed()) {
+            action next = action::keep;
+            if (arm_error != 0) {
+                // epoll_ctl() refused the fd on the driver.
                 c.status = completion_status::error;
-                c.raw_status = src.raw_error();
-                c.error = detail::from_native_error(src.raw_error());
-                retire = true;
-            } else if (result.size == 0) {
-                c.status = completion_status::closed;
-                retire = true;
+                c.raw_status = arm_error;
+                c.error = detail::from_native_error(arm_error);
+                next = action::retire;
             } else {
-                c.status = completion_status::ok;
-                c.raw_status = static_cast<std::int64_t>(result.size);
+                detail::readiness_source<Options> src{reg.fd, reg.kind};
+                const auto result = std::invoke(reader_fn, src);
+                c.result = result;
+                if (src.failed()) {
+                    c.status = completion_status::error;
+                    c.raw_status = src.raw_error();
+                    c.error = detail::from_native_error(src.raw_error());
+                    next = action::retire;
+                } else if (result.size == 0) {
+                    c.status = completion_status::closed;
+                    next = action::retire;
+                } else {
+                    c.status = completion_status::ok;
+                    c.raw_status = static_cast<std::int64_t>(result.size);
+                }
             }
-
-            // Post first, then retire: retire_direction() can make the
-            // registration reclaimable, and reclaim() would otherwise be able to
-            // free it (and its channel subscription) before this completion is
-            // even queued. read_ended makes that eventual free retire() rather
-            // than cancel() the subscription.
-            if (retire) registration_ptr->read_ended.store(true, std::memory_order_release);
+            c.completed_at = std::chrono::steady_clock::now();
             (void)this->service().template post<Tag>(c);
-            if (retire) retire_direction(*registration_ptr, /*read=*/true);
-        });
+            return next;
+        };
 
-        registration_ptr->read_active.store(true, std::memory_order_release);
-        if (!update_interest(*registration_ptr, is_new)) {
-            registration_ptr->read_active.store(false, std::memory_order_release);
-            if (is_new) { slots_[index].store(nullptr, std::memory_order_release); delete registration_ptr; }
-            return {};
-        }
-
-        return subscription{this, &backend::cancel_read_slot, index};
+        return launch(registration_ptr);
     }
 
 
@@ -206,100 +155,276 @@ namespace FCS::Worker::backend::epoll {
         const auto fd = detail::resolve_native(sink);
         const auto kind = detail::resolve_kind(sink);
 
-        std::size_t index{};
-        bool is_new{};
-        std::lock_guard setup_lock{slots_mutex_};
-        auto* registration_ptr = find_or_create_slot_locked(fd, kind, index, is_new);
-        if (!registration_ptr) return {};
+        const auto claimed = slots_state_.claim();
+        if (!claimed) return {};
 
-        registration_ptr->write_channel_subscription = this->service().template subscribe<Tag>(std::forward<Callback>(callback));
-        publish_handler(registration_ptr->on_writable, [this, registration_ptr, writer_fn = std::forward<Writer>(writer)]() mutable {
+        auto* registration_ptr = new registration{};
+        registration_ptr->h = *claimed;
+        registration_ptr->fd = fd;
+        registration_ptr->kind = kind;
+        registration_ptr->dir = direction::write;
+        registration_ptr->channel_subscription = this->service().template subscribe<Tag>(std::forward<Callback>(callback));
+        registration_ptr->on_event = [this, writer_fn = std::forward<Writer>(writer)](registration& reg, int arm_error) mutable -> action {
             const auto submitted_at = std::chrono::steady_clock::now();
-            detail::readiness_sink snk{registration_ptr->fd, registration_ptr->kind};
-            const auto written = std::invoke(writer_fn, snk);
-
             completion<Size> c{};
-            c.user_data = registration_ptr->index;
-            c.generation = registration_ptr->generation;
-            c.kind = registration_ptr->kind;
+            c.user_data = reg.h.index;
+            c.generation = reg.h.generation;
+            c.kind = reg.kind;
             c.op = completion_op::write;
             c.submitted_at = submitted_at;
-            c.completed_at = std::chrono::steady_clock::now();
-            c.result.size = written; // bytes actually written this call; buffer unused for writes
 
-            bool retire = false;
-            if (snk.failed()) {
+            action next = action::keep;
+            if (arm_error != 0) {
                 c.status = completion_status::error;
-                c.raw_status = snk.raw_error();
-                c.error = detail::from_native_error(snk.raw_error());
-                retire = true;
+                c.raw_status = arm_error;
+                c.error = detail::from_native_error(arm_error);
+                next = action::retire;
             } else {
-                c.status = completion_status::ok;
-                c.raw_status = static_cast<std::int64_t>(written);
+                detail::readiness_sink snk{reg.fd, reg.kind};
+                const auto written = std::invoke(writer_fn, snk);
+                c.result.size = written; // bytes actually written this call; buffer unused for writes
+                if (snk.failed()) {
+                    c.status = completion_status::error;
+                    c.raw_status = snk.raw_error();
+                    c.error = detail::from_native_error(snk.raw_error());
+                    next = action::retire;
+                } else {
+                    c.status = completion_status::ok;
+                    c.raw_status = static_cast<std::int64_t>(written);
+                }
             }
-
-            if (retire) registration_ptr->write_ended.store(true, std::memory_order_release);
+            c.completed_at = std::chrono::steady_clock::now();
             (void)this->service().template post<Tag>(c);
-            if (retire) retire_direction(*registration_ptr, /*read=*/false);
-        });
+            return next;
+        };
 
-        registration_ptr->write_active.store(true, std::memory_order_release);
-        if (!update_interest(*registration_ptr, is_new)) {
-            registration_ptr->write_active.store(false, std::memory_order_release);
-            if (is_new) { slots_[index].store(nullptr, std::memory_order_release); delete registration_ptr; }
-            return {};
+        return launch(registration_ptr);
+    }
+
+
+    // Hands a fully-initialized registration to the driver. Only the two stores
+    // below are visible to other threads; everything else about the registration
+    // was written before the release store.
+    template<typename Pool>
+    inline subscription backend<Pool>::launch(registration* registration_ptr) noexcept {
+        const auto handle = registration_ptr->h;
+        if (auto* cmd = new (std::nothrow) command{}) {
+            cmd->what = command::kind::arm;
+            cmd->h = handle;
+            slots_[handle.index].store(registration_ptr, std::memory_order_release);
+            cmds_.push(cmd);
+            wake_if_sleeping();
+            return subscription{this, &backend::cancel_slot, table::pack(handle)};
+        }
+        (void)slots_state_.request_cancel(handle);
+        slots_state_.release(handle.index);
+        delete registration_ptr;
+        return {};
+    }
+
+
+    template<typename Pool>
+    inline void backend<Pool>::post_command(command::kind what, table::handle h) noexcept {
+        auto* cmd = new (std::nothrow) command{};
+        if (!cmd) {
+            // Out of memory: the slot is already marked cancelled; make the
+            // driver find it by scanning instead of by command.
+            sweep_needed_.store(true, std::memory_order_seq_cst);
+        } else {
+            cmd->what = what;
+            cmd->h = h;
+            cmds_.push(cmd);
+        }
+        wake_if_sleeping();
+    }
+
+    // Never dereferences the registration: it may already have been freed by
+    // the driver. All it does is the lock-free slot-state transition; the
+    // driver does the rest when it sees the command.
+    template<typename Pool>
+    inline bool backend<Pool>::cancel_slot(void* owner, std::size_t packed) noexcept {
+        auto* self = static_cast<backend*>(owner);
+        const auto h = table::unpack(packed);
+        if (!self->slots_state_.request_cancel(h)) return false;
+        self->post_command(command::kind::cancel, h);
+        return true;
+    }
+
+
+    template<typename Pool>
+    inline void backend<Pool>::wake() noexcept {
+        if (wakeup_fd_ >= 0) { std::uint64_t one{1}; (void)!::write(wakeup_fd_, &one, sizeof(one)); }
+    }
+
+    // Pairs with the sequentially-consistent `sleeping_` announcement in
+    // run_loop(): either we see that the poller is about to block (and wake
+    // it), or the poller sees our command before it blocks. In shared_worker
+    // mode nothing ever sleeps, so this costs one load.
+    template<typename Pool>
+    inline void backend<Pool>::wake_if_sleeping() noexcept {
+        if (sleeping_.load(std::memory_order_seq_cst)) wake();
+    }
+
+    // ------------------------------------------------------------- driver side
+
+    // Applies registrations and cancellations in the order they were issued.
+    template<typename Pool>
+    inline bool backend<Pool>::service_commands() noexcept {
+        if (sweep_needed_.exchange(false, std::memory_order_acq_rel)) sweep_cancelled();
+
+        bool any = false;
+        for (command* cmd = cmds_.take_all(); cmd != nullptr;) {
+            command* next = cmd->next;
+            any = true;
+
+            auto* registration_ptr = cmd->h.index < capacity ? slots_[cmd->h.index].load(std::memory_order_acquire) : nullptr;
+            if (registration_ptr && same_generation(registration_ptr->h.generation, cmd->h.generation)) {
+                if (!slots_state_.live(registration_ptr->h)) {
+                    finish(registration_ptr);        // cancelled -- possibly before it ever armed
+                } else if (cmd->what == command::kind::arm) {
+                    arm(*registration_ptr);
+                }
+            }
+            delete cmd;
+            cmd = next;
+        }
+        return any;
+    }
+
+    // Fallback for a cancel command that couldn't be allocated.
+    template<typename Pool>
+    inline void backend<Pool>::sweep_cancelled() noexcept {
+        for (auto& slot : slots_) {
+            auto* registration_ptr = slot.load(std::memory_order_acquire);
+            if (registration_ptr && !slots_state_.live(registration_ptr->h)) finish(registration_ptr);
+        }
+    }
+
+
+    // Attaches a registration's direction to its fd's epoll entry, creating the
+    // entry if this is the fd's first registration.
+    template<typename Pool>
+    inline void backend<Pool>::arm(registration& registration_ref) noexcept {
+        if (registration_ref.fd < 0) { fail(registration_ref, EBADF); return; }
+
+        std::size_t index = no_entry, free_index = no_entry;
+        for (std::size_t i = 0; i < capacity; ++i) {
+            if (entries_[i].fd == registration_ref.fd) { index = i; break; }
+            if (free_index == no_entry && entries_[i].fd < 0) free_index = i;
+        }
+        const bool is_new = index == no_entry;
+        if (is_new) {
+            if (free_index == no_entry) { fail(registration_ref, ENOSPC); return; }
+            index = free_index;
+            entries_[index].fd = registration_ref.fd;
         }
 
-        return subscription{this, &backend::cancel_write_slot, index};
+        auto& e = entries_[index];
+        registration*& slot = e.dir[static_cast<std::size_t>(registration_ref.dir)];
+        registration* const replaced = std::exchange(slot, &registration_ref);
+        if (!sync_interest(index, is_new)) {
+            const int error = errno;
+            slot = replaced;
+            if (is_new) e = entry{};
+            fail(registration_ref, error);
+            return;
+        }
+        registration_ref.entry = index;
+
+        if (replaced) {
+            // Same direction registered again on this fd: the newest wins.
+            replaced->entry = no_entry;
+            (void)slots_state_.request_cancel(replaced->h);
+            finish(replaced);
+        }
+    }
+
+    // The fd couldn't be armed: tell the callback why, then drop the registration.
+    template<typename Pool>
+    inline void backend<Pool>::fail(registration& registration_ref, int error) noexcept {
+        (void)registration_ref.on_event(registration_ref, error);
+        (void)slots_state_.retire(registration_ref.h);
+        finish(&registration_ref, /*deliver_pending=*/true);
+    }
+
+    template<typename Pool>
+    inline void backend<Pool>::detach(registration& registration_ref) noexcept {
+        if (registration_ref.entry == no_entry) return;
+        const auto index = std::exchange(registration_ref.entry, no_entry);
+        auto& e = entries_[index];
+        e.dir[static_cast<std::size_t>(registration_ref.dir)] = nullptr;
+        if (!e.dir[0] && !e.dir[1]) {
+            (void)::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, e.fd, nullptr);
+            e = entry{};
+        } else {
+            (void)sync_interest(index, false);
+        }
+    }
+
+    // Programs the kernel with the interest implied by whichever directions are
+    // attached to the entry.
+    template<typename Pool>
+    inline bool backend<Pool>::sync_interest(std::size_t index, bool is_new) noexcept {
+        const auto& e = entries_[index];
+        ::epoll_event ev{};
+        ev.events = (e.dir[0] ? static_cast<std::uint32_t>(EPOLLIN) : 0u)
+                  | (e.dir[1] ? static_cast<std::uint32_t>(EPOLLOUT) : 0u);
+        ev.data.u32 = static_cast<std::uint32_t>(index);
+        if (::epoll_ctl(epoll_fd_, is_new ? EPOLL_CTL_ADD : EPOLL_CTL_MOD, e.fd, &ev) == 0) return true;
+        // Our table and the kernel's disagree: the fd was closed (which silently
+        // drops it from the epoll set) and its number reused without a cancel() in between.
+        if (errno != (is_new ? EEXIST : ENOENT)) return false;
+        return ::epoll_ctl(epoll_fd_, is_new ? EPOLL_CTL_MOD : EPOLL_CTL_ADD, e.fd, &ev) == 0;
     }
 
 
+    // Frees a registration with no lock held, so destructors of user code (the
+    // callback, the Reader/Writer captures) may call cancel() or register freely.
     template<typename Pool>
-    inline bool backend<Pool>::cancel_read_slot(void* owner, std::size_t slot) noexcept {
-        auto* self = static_cast<backend*>(owner);
-        // Same reasoning as find_or_create_slot(): guards this dereference
-        // against a concurrent reclaim() freeing the same registration.
-        // cancel() can be called from any thread, not just a poller one.
-        std::lock_guard lock{self->slots_mutex_};
-        auto* registration_ptr = self->slots_[slot].load(std::memory_order_acquire);
-        if (!registration_ptr) return false;
-        bool expected = true;
-        if (!registration_ptr->read_active.compare_exchange_strong(expected, false, std::memory_order_acq_rel)) return false;
-        self->detach_direction(*registration_ptr);
-        if (self->wakeup_fd_ >= 0) { std::uint64_t one{1}; (void)!::write(self->wakeup_fd_, &one, sizeof(one)); }
-        return true;
+    inline void backend<Pool>::finish(registration* registration_ptr, bool deliver_pending) noexcept {
+        detach(*registration_ptr);
+        // A registration that ended on its own (EOF/error) has just post()ed its
+        // terminal completion; retire() -- not the destructor's cancel() -- so
+        // that completion, still queued in the pool, isn't dropped with it.
+        if (deliver_pending) (void)registration_ptr->channel_subscription.retire();
+        const auto h = registration_ptr->h;
+        slots_[h.index].store(nullptr, std::memory_order_release);
+        (void)slots_state_.retire(h);
+        delete registration_ptr;
+        slots_state_.release(h.index);
     }
 
 
+    // Handles one epoll_event: drops whichever direction was cancelled or ERR/HUP
+    // leaves without a clean signal of its own, then runs on_event for whichever
+    // direction is both flagged ready and still live.
     template<typename Pool>
-    inline bool backend<Pool>::cancel_write_slot(void* owner, std::size_t slot) noexcept {
-        auto* self = static_cast<backend*>(owner);
-        std::lock_guard lock{self->slots_mutex_};
-        auto* registration_ptr = self->slots_[slot].load(std::memory_order_acquire);
-        if (!registration_ptr) return false;
-        bool expected = true;
-        if (!registration_ptr->write_active.compare_exchange_strong(expected, false, std::memory_order_acq_rel)) return false;
-        self->detach_direction(*registration_ptr);
-        if (self->wakeup_fd_ >= 0) { std::uint64_t one{1}; (void)!::write(self->wakeup_fd_, &one, sizeof(one)); }
-        return true;
-    }
+    inline void backend<Pool>::dispatch(std::size_t index, std::uint32_t flags) noexcept {
+        // Snapshot first: finish() can release the entry, so nothing below touches entries_[index].
+        registration* regs[2] = {entries_[index].dir[0], entries_[index].dir[1]};
+        constexpr std::uint32_t ready[2] = {EPOLLIN, EPOLLOUT};
+        const bool hung_up = (flags & (EPOLLERR | EPOLLHUP)) != 0;
 
-    // Handles one epoll_event: retires whichever direction ERR/HUP leaves
-    // without a clean signal of its own, then runs on_readable/on_writable
-    // for whichever direction is both flagged ready and still active.
-    template<typename Pool>
-    inline void backend<Pool>::dispatch(registration& reg, std::uint32_t flags) noexcept {
-        if ((flags & (EPOLLERR | EPOLLHUP)) && !(flags & EPOLLIN) && reg.read_active.load(std::memory_order_acquire))
-            retire_direction(reg, /*read=*/true);
-        if ((flags & (EPOLLERR | EPOLLHUP)) && !(flags & EPOLLOUT) && reg.write_active.load(std::memory_order_acquire))
-            retire_direction(reg, /*read=*/false);
-        // The handler pointer is loaded once and used for the whole call: a user
-        // thread re-registering this direction publishes a *new* handler and
-        // retires this one, which reclaim() can only free after this batch.
-        if ((flags & EPOLLIN) && reg.read_active.load(std::memory_order_acquire))
-            if (auto* h = reg.on_readable.load(std::memory_order_acquire)) h->fn();
-        if ((flags & EPOLLOUT) && reg.write_active.load(std::memory_order_acquire))
-            if (auto* h = reg.on_writable.load(std::memory_order_acquire)) h->fn();
+        for (std::size_t d = 0; d < 2; ++d) {
+            auto* registration_ptr = regs[d];
+            if (!registration_ptr) continue;
+            if (!slots_state_.live(registration_ptr->h)) {
+                finish(registration_ptr);        // cancelled, command not serviced yet
+                regs[d] = nullptr;
+            } else if (hung_up && !(flags & ready[d])) {
+                (void)slots_state_.retire(registration_ptr->h);
+                finish(registration_ptr);
+                regs[d] = nullptr;
+            }
+        }
+        for (std::size_t d = 0; d < 2; ++d) {
+            auto* registration_ptr = regs[d];
+            if (!registration_ptr || !(flags & ready[d])) continue;
+            const action next = registration_ptr->on_event(*registration_ptr, 0);
+            if (next == action::keep && slots_state_.live(registration_ptr->h)) continue;
+            (void)slots_state_.retire(registration_ptr->h);
+            finish(registration_ptr, /*deliver_pending=*/next == action::retire);
+        }
     }
 
 
@@ -307,79 +432,55 @@ namespace FCS::Worker::backend::epoll {
     inline void backend<Pool>::run_loop() {
         std::array<::epoll_event, 64> events{};
         for (;;) {
+            (void)service_commands();
+            if (!polling_.load(std::memory_order_acquire)) break;
+
+            // Announce the sleep *before* the final look at the command queue;
+            // see wake_if_sleeping().
+            sleeping_.store(true, std::memory_order_seq_cst);
+            if (!cmds_.empty() || sweep_needed_.load(std::memory_order_seq_cst) || !polling_.load(std::memory_order_seq_cst)) {
+                sleeping_.store(false, std::memory_order_seq_cst);
+                continue;
+            }
             const auto count = ::epoll_wait(epoll_fd_, events.data(), static_cast<int>(events.size()), -1);
+            sleeping_.store(false, std::memory_order_seq_cst);
             if (count < 0) { if (errno == EINTR) continue; break; }
 
-            bool woke = false;
             for (std::size_t i{}, n = static_cast<std::size_t>(count); i < n; ++i) {
                 const auto index = events[i].data.u32;
                 if (index == static_cast<std::uint32_t>(capacity)) {
                     std::uint64_t drained{};
                     (void)!::read(wakeup_fd_, &drained, sizeof(drained));
-                    woke = true;
                     continue;
                 }
-
-                auto* registration_ptr = slots_[index].load(std::memory_order_acquire);
-                if (!registration_ptr || !registration_ptr->active.load(std::memory_order_acquire)) continue;
-                dispatch(*registration_ptr, events[i].events);
+                dispatch(index, events[i].events);
             }
-
-            if (!woke) continue;
-            reclaim();
-            if (!polling_.load(std::memory_order_acquire)) break;
         }
     }
 
 
+    // execution::shared_worker path: one non-blocking pass, called from some pool
+    // worker's own loop. poll_registry guarantees at most one thread is inside
+    // this per backend at a time -- the single-driver contract everything above
+    // leans on.
     template<typename Pool>
     inline bool backend<Pool>::poll_once(void* owner) noexcept {
         auto* self = static_cast<backend*>(owner);
+        bool progressed = self->service_commands();
+
         std::array<::epoll_event, 64> events{};
         const auto count = ::epoll_wait(self->epoll_fd_, events.data(), static_cast<int>(events.size()), 0);
-        if (count <= 0) return false;
-
-        bool progressed = false;
-        for (std::size_t i{}, n = static_cast<std::size_t>(count); i < n; ++i) {
+        for (std::size_t i{}, n = count > 0 ? static_cast<std::size_t>(count) : 0; i < n; ++i) {
             const auto index = events[i].data.u32;
             if (index == static_cast<std::uint32_t>(capacity)) {
                 std::uint64_t drained{};
                 (void)!::read(self->wakeup_fd_, &drained, sizeof(drained));
                 continue;
             }
-
-            auto* registration_ptr = self->slots_[index].load(std::memory_order_acquire);
-            if (!registration_ptr || !registration_ptr->active.load(std::memory_order_acquire)) continue;
-            self->dispatch(*registration_ptr, events[i].events);
+            self->dispatch(index, events[i].events);
             progressed = true;
         }
-
-        self->reclaim();
         return progressed;
-    }
-
-
-    template<typename Pool>
-    inline void backend<Pool>::reclaim() noexcept {
-        // Only ever called by the single thread that's dispatching for this
-        // backend, *between* batches (or after it has stopped), so nothing freed
-        // here can be mid-dispatch. The early-out keeps the common case -- called
-        // once per non-empty poll -- to two relaxed loads: no mutex, no slot scan.
-        if (!scan_needed_.load(std::memory_order_relaxed) && retired_handler_count_.load(std::memory_order_relaxed) == 0) return;
-
-        std::lock_guard lock{slots_mutex_};
-        if (scan_needed_.exchange(false, std::memory_order_acq_rel)) {
-            for (auto& slot : slots_) {
-                auto* registration_ptr = slot.load(std::memory_order_acquire);
-                if (registration_ptr && !registration_ptr->active.load(std::memory_order_acquire)) {
-                    slot.store(nullptr, std::memory_order_release);
-                    delete registration_ptr;
-                }
-            }
-        }
-        for (auto* retired : retired_handlers_) delete retired;
-        retired_handlers_.clear();
-        retired_handler_count_.store(0, std::memory_order_relaxed);
     }
 
 }

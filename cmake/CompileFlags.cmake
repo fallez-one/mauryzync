@@ -11,7 +11,7 @@ function(SERVER_OPTIMIZE program_target scope)
             /Zc:__cplusplus
             /MP
 
-            /EHs-c-
+            $<$<BOOL:${FCS_NO_EXCEPTIONS}>:/EHs-c->
             "$<$<CONFIG:Debug>:/fsanitize=address>"
             "$<$<CONFIG:Debug>:/Od>"
             "$<$<CONFIG:Debug>:/sdl>"
@@ -28,7 +28,9 @@ function(SERVER_OPTIMIZE program_target scope)
             # "$<$<CONFIG:Release>:/fp:fast>"
             "$<$<CONFIG:Release>:/fp:precise>"
         )
-        target_compile_definitions(${program_target} ${scope} _HAS_EXCEPTIONS=0)
+        if(FCS_NO_EXCEPTIONS)
+            target_compile_definitions(${program_target} ${scope} _HAS_EXCEPTIONS=0)
+        endif()
         if(CMAKE_GENERATOR MATCHES "Ninja")
             target_compile_options(${program_target} ${scope} "$<$<CONFIG:Debug>:/Z7>")
 
@@ -64,7 +66,7 @@ function(SERVER_OPTIMIZE program_target scope)
 
             -pedantic
 
-            # -fno-exceptions
+            $<$<BOOL:${FCS_NO_EXCEPTIONS}>:-fno-exceptions>
             # -fno-rtti
             -fvisibility=hidden
             -fdiagnostics-color=always

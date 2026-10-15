@@ -59,7 +59,7 @@ using clock_type = std::chrono::steady_clock;
 
 int g_violations = 0;
 [[nodiscard]] inline unsigned long long ull(std::uint64_t v) noexcept { return static_cast<unsigned long long>(v); }
-[[nodiscard]] inline long long ll(long long v) noexcept { return v; }
+[[maybe_unused]] [[nodiscard]] inline long long ll(long long v) noexcept { return v; }
 #define VIOLATION(...) do { ++g_violations; std::printf("  VIOLATION %s:%d: ", __FILE__, __LINE__); std::printf(__VA_ARGS__); std::printf("\n"); } while (0)
 
 template<typename Pred>
@@ -374,7 +374,8 @@ bool run_tree(const scenario_cfg& cfg, bool pause_signals, const char* label) {
 
     const int before = g_violations;
     if (timed_out) VIOLATION("seed %u: the tree never finished (%zu accepted, %zu started, %zu done, %d hook(s))", cfg.seed, L.acc.size(), L.starts.size(), L.dones.size(), L.hooks);
-    std::size_t lost = 0, dup_start = 0, dup_done = 0, stuck_unexplained = 0, never_started = 0, ghost = 0, stuck_explained = 0;
+    [[maybe_unused]] std::size_t lost = 0;
+    std::size_t dup_start = 0, dup_done = 0, stuck_unexplained = 0, never_started = 0, ghost = 0, stuck_explained = 0;
     for (const auto& [id, n] : L.acc) {
         (void)n;
         const auto s = L.starts.count(id) ? L.starts[id] : 0;

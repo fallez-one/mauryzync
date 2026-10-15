@@ -1,9 +1,10 @@
 #ifndef FCS_SYNC_INTERRUPTIBLE_MUTEX
 #define FCS_SYNC_INTERRUPTIBLE_MUTEX
 #include <atomic>
-#include <concepts>
 #include <cstdint>
 #include <system_error>
+
+#include "../../exceptions.hpp"
 #include "mutex_traits.hpp"
 
 namespace FCS::synchronization {
@@ -17,18 +18,19 @@ namespace FCS::synchronization {
     // Keeping "locked" and "interrupted" as one enum (INTERRUPTED = -1) made them mutually exclusive:
     // interrupt() while the mutex was held overwrote LOCKED, so a plain lock() could then take it
     // while the holder was still inside, and the holder's unlock() erased the interruption.
+    // Apparently one atomic_uint8_t is enough.
     class interruptible_mutex {
-        static constexpr std::uint32_t LOCKED = 1u;
-        static constexpr std::uint32_t INTERRUPTED = 2u;
-        static constexpr std::uint32_t WAITERS = 4u;
-        std::atomic<std::uint32_t> state{0};
+        static constexpr std::uint8_t LOCKED = 1u;
+        static constexpr std::uint8_t INTERRUPTED = 2u;
+        static constexpr std::uint8_t WAITERS = 4u;
+        std::atomic<std::uint8_t> state{0};
 
         // Shared slow path. `interruptible`: give up (return false) once INTERRUPTED is set.
         // lock() passes false: it still WAKES on interrupt() (the word changes) but re-evaluates and
         // carries on waiting -- the interruption is masked from it and visible only through
         // is_interrupted(), which the caller checks once it owns the mutex.
         bool acquire(bool interruptible) noexcept {
-            std::uint32_t v = state.load(std::memory_order_relaxed);
+            std::uint8_t v = state.load(std::memory_order_relaxed);
             bool slept = false;
             for (;;) {
                 if (interruptible && (v & INTERRUPTED)) return false;
@@ -52,14 +54,14 @@ namespace FCS::synchronization {
 
     public:
         void lock() noexcept {
-            std::uint32_t expected = 0;
+            std::uint8_t expected = 0;
             // uncontended: one CAS, no loop, no flags to preserve
             if (state.compare_exchange_strong(expected, LOCKED, std::memory_order_acquire, std::memory_order_relaxed)) return;
             (void)acquire(false);
         }
 
         bool try_lock() noexcept {
-            std::uint32_t v = state.load(std::memory_order_relaxed);
+            std::uint8_t v = state.load(std::memory_order_relaxed);
             while (!(v & LOCKED)) {
                 if (state.compare_exchange_weak(v, v | LOCKED, std::memory_order_acquire, std::memory_order_relaxed)) return true;
             }
@@ -68,7 +70,7 @@ namespace FCS::synchronization {
 
         // true: acquired. false: interrupted before (or while) waiting -- the mutex is NOT held.
         [[nodiscard]] bool lock_interruptible() noexcept {
-            std::uint32_t expected = 0;
+            std::uint8_t expected = 0;
             if (state.compare_exchange_strong(expected, LOCKED, std::memory_order_acquire, std::memory_order_relaxed)) return true;
             return acquire(true);
         }
@@ -76,12 +78,12 @@ namespace FCS::synchronization {
         // Caller must hold the mutex, so LOCKED is known to be set: clearing it is a plain subtract of
         // one, a single `lock xadd` -- fetch_and(~LOCKED) with a used result compiles to a CAS loop.
         void unlock() noexcept {
-            const std::uint32_t prev = state.fetch_sub(LOCKED, std::memory_order_release);
+            const std::uint8_t prev = state.fetch_sub(LOCKED, std::memory_order_release);
             if (prev & WAITERS) {
                 // Someone sleeps. Clear the flag before waking one of them: the woken thread re-asserts it
                 // when it takes the lock (it has slept), so the next unlock wakes the next sleeper -- and
                 // once nobody is left the flag stays clear, instead of every unlock paying for a notify.
-                state.fetch_and(~WAITERS, std::memory_order_relaxed);
+                state.fetch_and(static_cast<std::uint8_t>(~WAITERS), std::memory_order_relaxed);
                 state.notify_one();
             }
         }
@@ -98,7 +100,7 @@ namespace FCS::synchronization {
             state.fetch_or(INTERRUPTED, std::memory_order_release);
             state.notify_all();
         }
-        void reset_interrupt() noexcept { state.fetch_and(~INTERRUPTED, std::memory_order_release); }
+        void reset_interrupt() noexcept { state.fetch_and(static_cast<std::uint8_t>(~INTERRUPTED), std::memory_order_release); }
 
         [[nodiscard]] bool is_interrupted() const noexcept {
             return (state.load(std::memory_order_acquire) & INTERRUPTED) != 0;
@@ -120,17 +122,20 @@ namespace FCS::synchronization {
         // Check this before touching what the mutex protects: an interrupted guard holds nothing.
         [[nodiscard]] bool owns_lock() const noexcept { return acquired_; }
 
-        [[nodiscard]] operator bool() {
+        [[nodiscard]] operator bool () {
             return owns_lock();
         }
 
-        void rollback() const noexcept {
+        void rollback() noexcept {
             if(acquired_) {
                 mtx.interrupt();
             }
         }
     };
 
+#if FCS_HAS_EXCEPTIONS
+    // Throws on interruption, so it only exists where exceptions do. Under -fno-exceptions use
+    // interruptible_lock_guard (above) and test owns_lock().
     template<InterruptibleMutexTrait Mutex>
     class interruptible_lock_guard_throwable {
         Mutex &mutex;
@@ -146,10 +151,8 @@ namespace FCS::synchronization {
         ~interruptible_lock_guard_throwable() { mutex.unlock(); }
         interruptible_lock_guard_throwable(const interruptible_lock_guard_throwable &) = delete;
         interruptible_lock_guard_throwable &operator=(const interruptible_lock_guard_throwable &) = delete;
-        void rollback() const noexcept {
-            mutex.interrupt();
-        }
     };
+#endif
 }
 
 #endif

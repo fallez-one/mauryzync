@@ -50,8 +50,8 @@ using namespace std::chrono_literals;
 namespace W = FCS::Worker;
 constexpr std::size_t chunk = 256;
 
-std::atomic<int> failures{0};
-#define CHECK(cond) do { if (!(cond)) { failures.fetch_add(1); std::printf("  FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond); } } while (0)
+std::atomic<int> test_failures{0};
+#define CHECK(cond) do { if (!(cond)) { test_failures.fetch_add(1); std::printf("  FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond); } } while (0)
 
 template<typename Pred>
 bool wait_for(Pred&& pred, std::chrono::milliseconds limit = 5000ms) {
@@ -289,7 +289,7 @@ void test_datagram(W::eventlooper& loop) {
     const auto rx_addr = loopback(local_port(rx));
     const auto tx_port = local_port(tx);
 
-    auto seen_port = std::make_shared<std::atomic<std::uint16_t>>(0);
+    auto seen_port = std::make_shared<std::atomic<std::uint16_t>>(std::uint16_t{0});
     auto c = std::make_shared<counters>();
     auto sub = loop.subscribe<tag_dgram, chunk>(W::source_ref<sock_t>{rx, W::source_kind::datagram}, any_reader{seen_port.get()},
                                                 [c, seen_port](W::completion<chunk> r) { c->take(r); });
@@ -443,7 +443,7 @@ int main() {
 #if defined(_WIN32)
     ::WSACleanup();
 #endif
-    if (failures.load() != 0) { std::printf("\nbackend_contract: %d FAILED\n", failures.load()); return 1; }
+    if (test_failures.load() != 0) { std::printf("\nbackend_contract: %d FAILED\n", test_failures.load()); return 1; }
     std::printf("\nbackend_contract: all passed\n");
     return 0;
 }

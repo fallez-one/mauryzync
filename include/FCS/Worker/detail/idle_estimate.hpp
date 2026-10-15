@@ -108,7 +108,7 @@ namespace FCS::Worker::detail {
 
         alignas(64) std::atomic<std::uint64_t> word_{0};
         std::uint32_t ttl_{8}; // written only by configure(), before workers start
-        char pad_[64 - sizeof(std::uint32_t)]{};
+        [[maybe_unused]] char pad_[64 - sizeof(std::uint32_t)]{};
     };
 
 }

@@ -3,6 +3,8 @@
 #include <atomic>
 #include <coroutine>
 #include <cstdint>
+#include "../../exceptions.hpp"
+
 #include <exception>
 #include <optional>
 
@@ -41,17 +43,21 @@ namespace FCS::Worker::detail {
         void release() noexcept;
 
         void set_value(T value) noexcept;
-        void set_exception(std::exception_ptr error) noexcept;
+#if FCS_HAS_EXCEPTIONS
+        void set_exception(std::exception_ptr error) noexcept;   // nothing to carry under -fno-exceptions
+#endif
 
         [[nodiscard]] bool is_ready() const noexcept;
         [[nodiscard]] bool attach(std::coroutine_handle<> handle) noexcept;
-        [[nodiscard]] T take_value();
+        [[nodiscard]] T take_value();   // rethrows a stored exception, where exceptions exist
 
     private:
         static constexpr std::uintptr_t ready_flag = 1;
 
         std::optional<T> value_{};
+#if FCS_HAS_EXCEPTIONS
         std::exception_ptr error_{};
+#endif
         std::atomic<std::uintptr_t> continuation_{};
         std::atomic<int> owners_;
     };
