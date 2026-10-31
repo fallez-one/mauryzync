@@ -129,15 +129,17 @@ static int run(W::execution::policy policy, const char* name) {
     {
         g_done = false; watchdog("arm failure report");
         std::atomic<int> errors{0}, other{0};
-        const int regular = ::open("/proc/self/exe", O_RDONLY | O_CLOEXEC); // epoll can't watch regular files (EPERM)
+        // A stale fd number: every backend refuses it (EBADF). A regular file is no good here --
+        // epoll refuses it (EPERM) but kqueue legitimately accepts it (it is always "readable").
+        const int stale = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        ::close(stale);
         auto cb = [&](W::completion<chunk> r) { (r.status == W::completion_status::error ? errors : other).fetch_add(1); };
-        auto s1 = loop.subscribe<tag_e, chunk>(W::source_ref<int>{regular, W::source_kind::io}, reader{}, cb);
+        auto s1 = loop.subscribe<tag_e, chunk>(W::source_ref<int>{stale, W::source_kind::io}, reader{}, cb);
         auto s2 = loop.subscribe<tag_f, chunk>(W::source_ref<int>{-1, W::source_kind::io}, reader{}, cb);
         if (!wait_for([&] { return errors.load() == 2; })) { std::printf("FAIL: arm failures not reported (%d)\n", errors.load()); return 1; }
         std::this_thread::sleep_for(50ms);
         if (errors.load() != 2 || other.load() != 0) { std::printf("FAIL: arm failure delivered more than once\n"); return 1; }
         if (s1.cancel() || s2.cancel()) { std::printf("FAIL: failed registration still cancellable\n"); return 1; }
-        close_later(regular);
         g_done = true;
     }
 
@@ -146,13 +148,14 @@ static int run(W::execution::policy policy, const char* name) {
     {
         g_done = false; watchdog("replace semantics");
         int e[2]; make_pair(e);
-        std::atomic<int> old_hits{0}, new_hits{0};
+        // static: a completion queued just before cancel() still runs after it, i.e. possibly after this block.
+        static std::atomic<int> old_hits, new_hits, sink_hits;
+        old_hits = 0; new_hits = 0; sink_hits = 0;
         auto older = loop.subscribe<tag_g, chunk>(W::source_ref<int>{e[0], W::source_kind::io}, reader{},
                                                   [&](W::completion<chunk>) { old_hits.fetch_add(1); });
         auto newer = loop.subscribe<tag_h, chunk>(W::source_ref<int>{e[0], W::source_kind::io}, reader{},
                                                   [&](W::completion<chunk> r) { if (r.status == W::completion_status::ok) new_hits.fetch_add(1); });
         // Full duplex alongside, registered from another thread at the same time.
-        std::atomic<int> sink_hits{0};
         W::subscription sink;
         std::thread t([&] {
             sink = loop.subscribe_write<tag_i, chunk>(W::source_ref<int>{e[0], W::source_kind::io},

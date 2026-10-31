@@ -7,9 +7,10 @@ Current support:
  - IOCP
  - epoll
  - io_uring
+ - kqueue
 
 # What this is
-An asynchronous runtime I make because I like solving systems problem at practical level. The aim is, "what if we have a bounded asynchronous runtime that spirally goes down to even work itself (arbitrary function)".
+An asynchronous runtime I make because I like solving systems problem at practical level. The aim is, "what if we have a bounded asynchronous runtime, that even the work representation itself is bounded? (end-to-end attempt)".
 
 It is deliberately low-level, opinionated machinery, unopinionated policy. You build something on top of it.
 
@@ -73,6 +74,7 @@ int main() {
 
     // Under the hood, enqueue relies on inline_function. enqueue and practically almost anything on FCS-Workers
     // is using inline_function.
+    // This is one of the "what if we have a bounded asynchronous runtime, that even the work representation itself is bounded?" realized.
     {
         std::cout << std::boolalpha;
         static constexpr std::size_t CapturableSizeForFunc1 = 8;
@@ -110,8 +112,10 @@ More detailed API usage in `examples/example.cpp`!
 # OS and architecture tested
 - Android ARM64 (via Termux)
 - Raspberry Pi 5
-- Windows (i3-9100F, i3-3240)
-- Linux
+- Windows 10 (i3-9100F, i3-3240)
+- Linux 7.3
+- FreeBSD 14.5 (via QEMU, LLVM 18)
+- macOS 10.13.6 (via VirtualBox, LLVM 18)
 
 # License
 The project is using a permissive BSD 3-Clause license, free of charge. Do not attribute me for derivates (attribution). See `LICENSE.`

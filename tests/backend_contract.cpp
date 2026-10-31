@@ -1,5 +1,5 @@
 // Backend contract test: the same assertions run against whichever backend the
-// build selected (epoll, io_uring or IOCP) under both execution policies.
+// build selected (epoll, kqueue, io_uring or IOCP) under both execution policies.
 // It pins down the *observable* behaviour the three backends must share:
 //
 //   1. stream reads deliver exactly the bytes sent
